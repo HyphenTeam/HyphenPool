@@ -53,6 +53,7 @@ pub struct PoolAccountingConfig {
     pub mode: PoolMode,
     pub pool_fee_bps: u16,
     pub pool_wallet: [u8; 32],
+    pub pool_view_public: [u8; 32],
     pub pplns_window_factor: u32,
     pub state_dir: Option<PathBuf>,
 }
@@ -176,6 +177,8 @@ impl AccountingState {
 pub struct PoolAccounting {
     state: RwLock<AccountingState>,
     state_path: Option<PathBuf>,
+    /// Maps spend_public → view_public for all registered miners and the pool wallet.
+    view_keys: RwLock<HashMap<[u8; 32], [u8; 32]>>,
 }
 
 impl PoolAccounting {
@@ -188,9 +191,14 @@ impl PoolAccounting {
             .as_ref()
             .and_then(|path| Self::load_state(path))
             .unwrap_or_else(|| AccountingState::new(&config));
+        let mut view_keys = HashMap::new();
+        if config.pool_view_public != [0u8; 32] {
+            view_keys.insert(config.pool_wallet, config.pool_view_public);
+        }
         Self {
             state: RwLock::new(state),
             state_path,
+            view_keys: RwLock::new(view_keys),
         }
     }
 
@@ -198,7 +206,8 @@ impl PoolAccounting {
         self.state.read().mode
     }
 
-    pub fn parse_wallet_input(input: &str) -> Result<[u8; 32], String> {
+    /// Parse a wallet address string and return `(view_public, spend_public)`.
+    pub fn parse_wallet_input(input: &str) -> Result<([u8; 32], [u8; 32]), String> {
         if input.starts_with("hy1") {
             let encoded = &input[3..];
             let payload = bs58::decode(encoded)
@@ -214,20 +223,14 @@ impl PoolAccounting {
             if checksum.as_bytes()[..4] != payload[65..69] {
                 return Err("hy1 address checksum mismatch".into());
             }
-            let mut pubkey = [0u8; 32];
-            pubkey.copy_from_slice(&payload[33..65]);
-            return Ok(pubkey);
+            let mut view_public = [0u8; 32];
+            view_public.copy_from_slice(&payload[1..33]);
+            let mut spend_public = [0u8; 32];
+            spend_public.copy_from_slice(&payload[33..65]);
+            return Ok((view_public, spend_public));
         }
 
-        let bytes = hex::decode(input)
-            .map_err(|error| format!("wallet must be a hy1... address or 64 hex chars: {error}"))?;
-        if bytes.len() != 32 {
-            return Err("hex wallet must be exactly 32 bytes (64 hex chars)".into());
-        }
-
-        let mut pubkey = [0u8; 32];
-        pubkey.copy_from_slice(&bytes);
-        Ok(pubkey)
+        Err("wallet must be a hy1... address".into())
     }
 
     pub fn pool_wallet(&self) -> [u8; 32] {
@@ -236,6 +239,16 @@ impl PoolAccounting {
 
     pub fn pool_fee_bps(&self) -> u16 {
         self.state.read().pool_fee_bps
+    }
+
+    /// Store the view_public for a given spend_public (miner address).
+    pub fn register_view_key(&self, spend_public: [u8; 32], view_public: [u8; 32]) {
+        self.view_keys.write().insert(spend_public, view_public);
+    }
+
+    /// Look up the view_public for a given spend_public.
+    pub fn get_view_public(&self, spend_public: &[u8; 32]) -> Option<[u8; 32]> {
+        self.view_keys.read().get(spend_public).copied()
     }
 
     pub fn reward_recipient_for_wallet(&self, wallet_address: [u8; 32]) -> [u8; 32] {

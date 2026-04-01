@@ -274,8 +274,8 @@ impl<T: TemplateProvider + Send + Sync + 'static> StratumServer<T> {
                     .unwrap_or("anon")
                     .to_string();
                 let wallet_spec = worker.split('.').next().unwrap_or("");
-                let wallet_address = match PoolAccounting::parse_wallet_input(wallet_spec) {
-                    Ok(wallet_address) => wallet_address,
+                let (view_public, wallet_address) = match PoolAccounting::parse_wallet_input(wallet_spec) {
+                    Ok(keys) => keys,
                     Err(error) => {
                         return Ok(Some(JsonRpcResponse {
                             id: req.id.clone(),
@@ -293,6 +293,7 @@ impl<T: TemplateProvider + Send + Sync + 'static> StratumServer<T> {
                         ses.authorized = true;
                     }
                 }
+                self.accounting.register_view_key(wallet_address, view_public);
                 self.accounting
                     .register_miner(wallet_address, wallet_address);
                 info!("Stratum worker authorized: {worker}");
@@ -437,11 +438,16 @@ impl<T: TemplateProvider + Send + Sync + 'static> StratumServer<T> {
                 let block_reward = h.reward;
                 let block_total_fee = h.total_fee;
                 let block_difficulty = h.difficulty;
+
+                let reward_recipient = h.miner_pubkey;
+                let view_pub = self.accounting.get_view_public(&reward_recipient)
+                    .unwrap_or([0u8; 32]);
+
                 let block = Block {
                     header: h,
                     transactions: job.transactions.clone(),
                     uncle_headers: Vec::new(),
-                    pq_signature: Vec::new(),
+                    pq_signature: view_pub.to_vec(),
                 };
                 let data = bincode::serialize(&block).unwrap_or_default();
                 let tp = Arc::clone(&self.tp_client);

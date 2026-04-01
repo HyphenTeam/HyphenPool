@@ -36,8 +36,11 @@ struct MinerSession {
     invalid_shares: u64,
     vardiff: VarDiffState,
     thread_count: u32,
-    /// The miner's payout wallet address (32-byte pubkey).
+    /// The miner's payout wallet address (32-byte spend_public).
     wallet_address: [u8; 32],
+    /// The miner's view public key (32 bytes), used for coinbase output creation.
+    #[allow(dead_code)]
+    view_public: [u8; 32],
 }
 
 struct VarDiffState {
@@ -356,7 +359,12 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
         miner_pk.copy_from_slice(&login_env.sender_pubkey);
 
         let mut wallet_addr = miner_pk;
-        if login.payout_pubkey.len() == 32 {
+        let mut view_public = [0u8; 32];
+        if login.payout_pubkey.len() == 64 {
+            // New format: view_public (32) + spend_public (32)
+            view_public.copy_from_slice(&login.payout_pubkey[..32]);
+            wallet_addr.copy_from_slice(&login.payout_pubkey[32..64]);
+        } else if login.payout_pubkey.len() == 32 {
             wallet_addr.copy_from_slice(&login.payout_pubkey);
         }
 
@@ -382,9 +390,11 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                     vardiff: VarDiffState::new(initial_diff),
                     thread_count: login.thread_count,
                     wallet_address: wallet_addr,
+                    view_public,
                 },
             );
         }
+        self.accounting.register_view_key(wallet_addr, view_public);
         self.accounting.register_miner(miner_pk, wallet_addr);
 
         let current_job = self.job_manager.current_job();
@@ -736,11 +746,15 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                 let block_total_fee = mined_header.total_fee;
                 let block_difficulty = mined_header.difficulty;
 
+                // Look up view_public for the reward recipient to enable coinbase creation
+                let view_pub = self.accounting.get_view_public(&reward_recipient)
+                    .unwrap_or([0u8; 32]);
+
                 let block = Block {
                     header: mined_header,
                     transactions: job.transactions.clone(),
                     uncle_headers: Vec::new(),
-                    pq_signature: Vec::new(),
+                    pq_signature: view_pub.to_vec(),
                 };
 
                 let block_hash = block.hash();

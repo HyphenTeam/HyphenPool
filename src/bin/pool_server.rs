@@ -160,8 +160,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .parse()
         .map_err(|e| format!("invalid API bind address: {e}"))?;
 
-    let pool_pubkey = if cli.pool_wallet.is_empty() {
-        *sk.public_key().as_bytes()
+    let (pool_view_public, pool_pubkey) = if cli.pool_wallet.is_empty() {
+        ([0u8; 32], *sk.public_key().as_bytes())
     } else {
         PoolAccounting::parse_wallet_input(&cli.pool_wallet)?
     };
@@ -178,6 +178,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mode: cli.payout_mode,
         pool_fee_bps,
         pool_wallet: pool_pubkey,
+        pool_view_public,
         pplns_window_factor: cli.pplns_window_factor,
         state_dir: Some(PathBuf::from(&cli.pool_state_dir)),
     }));
