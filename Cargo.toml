@@ -1,0 +1,35 @@
+[package]
+name = "hyphen-pool"
+version = "0.1.0"
+edition = "2021"
+authors = ["Hyphen Contributors"]
+license = "AGPL-3.0"
+description = "Mining pool server for the Hyphen blockchain"
+
+[workspace]
+
+[[bin]]
+name = "hyphen-pool-server"
+path = "src/bin/pool_server.rs"
+
+[dependencies]
+async-trait = "0.1"
+axum = "0.8"
+bincode = "1"
+blake3 = "1.8"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+ed25519-dalek = { version = "2.1", features = ["serde", "rand_core"] }
+hex = { version = "0.4", features = ["serde"] }
+parking_lot = "0.12"
+prost = "0.13"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"
+tokio = { version = "1", features = ["full"] }
+serde_json = "1"
+bs58 = "0.5"
+tower-http = { version = "0.6", features = ["cors"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zeroize = { version = "1", features = ["derive"] }
