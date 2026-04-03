@@ -5,6 +5,59 @@ use serde::{Deserialize, Serialize};
 
 use crate::primitives::{blake3_hash, BlockHeader, ChainConfig, Hash256};
 
+#[derive(Clone)]
+pub struct EpochKernelParams {
+    pub sbox: [u8; 256],
+    pub rot_offsets: [u32; 12],
+    pub mix_constants: [u64; 12],
+    pub slot_perm: [usize; 8],
+    pub stride_salt: [u64; 12],
+}
+
+impl EpochKernelParams {
+    pub fn derive(epoch_seed: &[u8; 32]) -> Self {
+        let key: [u8; 32] = *epoch_seed;
+        let mut h = blake3::Hasher::new_keyed(&key);
+        h.update(b"EMK_epoch_kernel_params_v1");
+        let mut xof = h.finalize_xof();
+
+        let mut sbox = BASE_SBOX;
+        let mut rand_buf = [0u8; 512];
+        xof.fill(&mut rand_buf);
+        for i in (1..256).rev() {
+            let j = (u16::from_le_bytes([rand_buf[i * 2], rand_buf[i * 2 + 1]]) as usize) % (i + 1);
+            sbox.swap(i, j);
+        }
+
+        let mut rot_buf = [0u8; 12];
+        xof.fill(&mut rot_buf);
+        let mut rot_offsets = [0u32; 12];
+        for i in 0..12 { rot_offsets[i] = (rot_buf[i] & 63) as u32; }
+
+        let mut mix_buf = [0u8; 96];
+        xof.fill(&mut mix_buf);
+        let mut mix_constants = [0u64; 12];
+        for i in 0..12 {
+            mix_constants[i] = u64::from_le_bytes(mix_buf[i * 8..(i + 1) * 8].try_into().unwrap()) | 1;
+        }
+
+        let mut slot_perm = [0usize, 1, 2, 3, 4, 5, 6, 7];
+        let mut perm_buf = [0u8; 8];
+        xof.fill(&mut perm_buf);
+        for i in (1..8).rev() { let j = (perm_buf[i] as usize) % (i + 1); slot_perm.swap(i, j); }
+
+        let mut stride_buf = [0u8; 96];
+        xof.fill(&mut stride_buf);
+        let mut stride_salt = [0u64; 12];
+        for i in 0..12 {
+            let raw = u64::from_le_bytes(stride_buf[i * 8..(i + 1) * 8].try_into().unwrap());
+            stride_salt[i] = 31 + (raw % 221);
+        }
+
+        Self { sbox, rot_offsets, mix_constants, slot_perm, stride_salt }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ArenaParams {
     pub total_size: usize,
@@ -181,6 +234,16 @@ fn div_wide(high: u128, low: u128, divisor: u128) -> (u128, u128) {
 }
 
 pub fn evaluate_pow(header: &BlockHeader, arena: &EpochArena, cfg: &ChainConfig) -> Hash256 {
+    let epoch = EpochKernelParams::derive(arena.params.epoch_seed.as_bytes());
+    evaluate_pow_with_epoch(header, arena, cfg, &epoch)
+}
+
+pub fn evaluate_pow_with_epoch(
+    header: &BlockHeader,
+    arena: &EpochArena,
+    cfg: &ChainConfig,
+    epoch: &EpochKernelParams,
+) -> Hash256 {
     let header_bytes = header.serialise_for_hash();
     let seed = blake3_hash(&header_bytes);
     let mut scratchpad = Scratchpad::new(cfg.scratchpad_size, &seed);
@@ -190,7 +253,7 @@ pub fn evaluate_pow(header: &BlockHeader, arena: &EpochArena, cfg: &ChainConfig)
         let page_index = scratchpad.next_page(page_count);
         let page = arena.page(page_index);
         let kernel_id = scratchpad.select_kernel(page[32], cfg.kernel_count);
-        let kernel_out = execute_kernel(kernel_id, page, &scratchpad.state);
+        let kernel_out = execute_kernel(kernel_id, page, &scratchpad.state, &epoch);
         scratchpad.mix_state(&kernel_out);
 
         let write_pos =
@@ -212,21 +275,21 @@ pub fn evaluate_pow(header: &BlockHeader, arena: &EpochArena, cfg: &ChainConfig)
     scratchpad.finalize()
 }
 
-fn execute_kernel(kernel_id: u8, page: &[u8], state: &[u8; 64]) -> [u8; 64] {
+fn execute_kernel(kernel_id: u8, page: &[u8], state: &[u8; 64], ep: &EpochKernelParams) -> [u8; 64] {
     match kernel_id {
-        0 => kernel_div_chain(page, state),
-        1 => kernel_bit_weave(page, state),
-        2 => kernel_sparse_step(page, state),
-        3 => kernel_prefix_scan(page, state),
-        4 => kernel_micro_sort(page, state),
-        5 => kernel_var_decode(page, state),
-        6 => kernel_hash_mix(page, state),
-        7 => kernel_branch_maze(page, state),
-        8 => kernel_aes_cascade(page, state),
-        9 => kernel_float_emulate(page, state),
-        10 => kernel_scatter_gather(page, state),
-        11 => kernel_mod_exp_chain(page, state),
-        _ => kernel_div_chain(page, state),
+        0 => kernel_div_chain(page, state, ep),
+        1 => kernel_bit_weave(page, state, ep),
+        2 => kernel_sparse_step(page, state, ep),
+        3 => kernel_prefix_scan(page, state, ep),
+        4 => kernel_micro_sort(page, state, ep),
+        5 => kernel_var_decode(page, state, ep),
+        6 => kernel_hash_mix(page, state, ep),
+        7 => kernel_branch_maze(page, state, ep),
+        8 => kernel_aes_cascade(page, state, ep),
+        9 => kernel_float_emulate(page, state, ep),
+        10 => kernel_scatter_gather(page, state, ep),
+        11 => kernel_mod_exp_chain(page, state, ep),
+        _ => kernel_div_chain(page, state, ep),
     }
 }
 
@@ -255,61 +318,62 @@ fn to_output(values: &[u64; 8]) -> [u8; 64] {
     output
 }
 
-fn kernel_div_chain(page: &[u8], state: &[u8; 64]) -> [u8; 64] {
+fn kernel_div_chain(page: &[u8], state: &[u8; 64], ep: &EpochKernelParams) -> [u8; 64] {
     let mut acc = [0u64; 8];
-    for index in 0..8 {
-        acc[index] = state_u64(state, index);
-    }
+    for index in 0..8 { acc[index] = state_u64(state, index); }
+    let stride = ep.stride_salt[0] as usize;
+    let rot = ep.rot_offsets[0];
     for step in 0..64u64 {
-        let page_val = read_u64_le(page, (step as usize * 61) % page.len());
+        let page_val = read_u64_le(page, (step as usize).wrapping_mul(stride) % page.len());
         let divisor = page_val.wrapping_add(3) | 3;
         let slot = step as usize % 8;
-        let dividend = acc[slot]
-            .wrapping_add(acc[(slot + 1) % 8])
-            .wrapping_add(step);
+        let dividend = acc[slot].wrapping_add(acc[(slot + 1) % 8]).wrapping_add(step);
         acc[slot] = dividend / divisor;
-        acc[(slot + 3) % 8] = acc[(slot + 3) % 8].wrapping_add(dividend % divisor);
+        acc[(slot + 3) % 8] = acc[(slot + 3) % 8].wrapping_add(dividend % divisor).rotate_left(rot);
     }
     to_output(&acc)
 }
 
-fn kernel_bit_weave(page: &[u8], state: &[u8; 64]) -> [u8; 64] {
+fn kernel_bit_weave(page: &[u8], state: &[u8; 64], ep: &EpochKernelParams) -> [u8; 64] {
     let mut acc = [0u64; 8];
-    for index in 0..8 {
-        acc[index] = state_u64(state, index);
-    }
+    for index in 0..8 { acc[index] = state_u64(state, index); }
+    let stride = ep.stride_salt[1] as usize;
+    let mix_c = ep.mix_constants[1];
+    let rot_off = ep.rot_offsets[1];
     for step in 0..64u64 {
-        let data = read_u64_le(page, (step as usize * 43 + 17) % page.len());
-        let rot_amount = (data & 63) as u32;
+        let data = read_u64_le(page, (step as usize).wrapping_mul(stride).wrapping_add(17) % page.len());
+        let rot_amount = ((data & 63) as u32).wrapping_add(rot_off) & 63;
         let slot = step as usize % 8;
         acc[slot] = acc[slot].rotate_left(rot_amount) ^ data;
         acc[(slot + 5) % 8] = acc[(slot + 5) % 8].rotate_right((acc[slot] & 63) as u32);
-        acc[(slot + 2) % 8] ^= acc[slot].wrapping_mul(0x9E3779B97F4A7C15);
+        acc[(slot + 2) % 8] ^= acc[slot].wrapping_mul(mix_c);
     }
     to_output(&acc)
 }
 
-fn kernel_sparse_step(page: &[u8], state: &[u8; 64]) -> [u8; 64] {
+fn kernel_sparse_step(page: &[u8], state: &[u8; 64], ep: &EpochKernelParams) -> [u8; 64] {
     let mut acc = [0u64; 8];
-    for index in 0..8 {
-        acc[index] = state_u64(state, index);
-    }
+    for index in 0..8 { acc[index] = state_u64(state, index); }
+    let stride = ep.stride_salt[2] as usize;
+    let mix_c = ep.mix_constants[2];
     for step in 0..48u64 {
-        let idx_raw = read_u64_le(page, (step as usize * 83) % page.len());
+        let idx_raw = read_u64_le(page, (step as usize).wrapping_mul(stride) % page.len());
         let idx = (idx_raw as usize) % (page.len() / 8);
         let value = read_u64_le(page, idx * 8 % page.len());
         let slot = step as usize % 8;
         acc[slot] = acc[slot].wrapping_add(value.wrapping_mul(acc[(slot + 1) % 8] | 1));
-        acc[(slot + 4) % 8] ^= value.rotate_left((acc[slot] & 31) as u32);
+        acc[(slot + 4) % 8] ^= value.rotate_left((acc[slot] & 31) as u32).wrapping_mul(mix_c);
     }
     to_output(&acc)
 }
 
-fn kernel_prefix_scan(page: &[u8], state: &[u8; 64]) -> [u8; 64] {
+fn kernel_prefix_scan(page: &[u8], state: &[u8; 64], ep: &EpochKernelParams) -> [u8; 64] {
+    let stride = ep.stride_salt[3] as usize;
+    let mix = ep.mix_constants[3];
     let mut arr = [0u64; 64];
     for index in 0..64 {
-        arr[index] =
-            read_u64_le(page, index * 61 % page.len()).wrapping_add(state_u64(state, index % 8));
+        arr[index] = read_u64_le(page, index.wrapping_mul(stride) % page.len()).wrapping_add(state_u64(state, index % 8))
+            ^ mix.wrapping_mul(index as u64);
     }
     let mut distance = 1;
     while distance < 64 {
@@ -347,10 +411,12 @@ fn kernel_prefix_scan(page: &[u8], state: &[u8; 64]) -> [u8; 64] {
     to_output(&acc)
 }
 
-fn kernel_micro_sort(page: &[u8], state: &[u8; 64]) -> [u8; 64] {
+fn kernel_micro_sort(page: &[u8], state: &[u8; 64], ep: &EpochKernelParams) -> [u8; 64] {
+    let stride = ep.stride_salt[4] as usize;
+    let mix_c = ep.mix_constants[4];
     let mut arr = [0u64; 32];
     for index in 0..32 {
-        arr[index] = read_u64_le(page, index * 127 % page.len()) ^ state_u64(state, index % 8);
+        arr[index] = read_u64_le(page, index.wrapping_mul(stride) % page.len()) ^ state_u64(state, index % 8);
     }
     for index in 1..32 {
         let key = arr[index];
@@ -363,16 +429,16 @@ fn kernel_micro_sort(page: &[u8], state: &[u8; 64]) -> [u8; 64] {
     }
     let mut acc = [0u64; 8];
     for index in 0..32 {
-        acc[index % 8] = acc[index % 8].wrapping_add(arr[index].wrapping_mul(index as u64 + 1));
+        acc[index % 8] = acc[index % 8].wrapping_add(arr[index].wrapping_mul((index as u64 + 1).wrapping_mul(mix_c)));
     }
     to_output(&acc)
 }
 
-fn kernel_var_decode(page: &[u8], state: &[u8; 64]) -> [u8; 64] {
+fn kernel_var_decode(page: &[u8], state: &[u8; 64], ep: &EpochKernelParams) -> [u8; 64] {
     let mut acc = [0u64; 8];
-    for index in 0..8 {
-        acc[index] = state_u64(state, index);
-    }
+    for index in 0..8 { acc[index] = state_u64(state, index); }
+    let rot_off = ep.rot_offsets[5];
+    let mix_c = ep.mix_constants[5];
     let mut cursor = (state_u64(state, 0) as usize) % page.len();
     for step in 0..48u64 {
         let mut result = 0u64;
@@ -387,13 +453,13 @@ fn kernel_var_decode(page: &[u8], state: &[u8; 64]) -> [u8; 64] {
             }
         }
         let slot = step as usize % 8;
-        acc[slot] = acc[slot].wrapping_add(result);
-        acc[(slot + 3) % 8] ^= result.rotate_left((step as u32) & 63);
+        acc[slot] = acc[slot].wrapping_add(result.wrapping_mul(mix_c));
+        acc[(slot + 3) % 8] ^= result.rotate_left(((step as u32) & 63).wrapping_add(rot_off) & 63);
     }
     to_output(&acc)
 }
 
-static SBOX: [u8; 256] = [
+static BASE_SBOX: [u8; 256] = [
     0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
     0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0, 0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
     0xb7, 0xfd, 0x93, 0x26, 0x36, 0x3f, 0xf7, 0xcc, 0x34, 0xa5, 0xe5, 0xf1, 0x71, 0xd8, 0x31, 0x15,
@@ -412,13 +478,14 @@ static SBOX: [u8; 256] = [
     0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16,
 ];
 
-fn kernel_hash_mix(page: &[u8], state: &[u8; 64]) -> [u8; 64] {
+fn kernel_hash_mix(page: &[u8], state: &[u8; 64], ep: &EpochKernelParams) -> [u8; 64] {
     let mut block = [0u8; 64];
     block.copy_from_slice(state);
+    let stride = ep.stride_salt[6] as usize;
     for round in 0..16u32 {
-        let page_off = (round as usize * 251) % page.len().saturating_sub(16).max(1);
+        let page_off = (round as usize).wrapping_mul(stride) % page.len().saturating_sub(16).max(1);
         for byte in &mut block {
-            *byte = SBOX[*byte as usize];
+            *byte = ep.sbox[*byte as usize];
         }
         for index in 0..16 {
             block[index + (round as usize % 4) * 16] ^= page[page_off + index % page.len().min(16)];
@@ -435,26 +502,28 @@ fn kernel_hash_mix(page: &[u8], state: &[u8; 64]) -> [u8; 64] {
     block
 }
 
-fn kernel_branch_maze(page: &[u8], state: &[u8; 64]) -> [u8; 64] {
+fn kernel_branch_maze(page: &[u8], state: &[u8; 64], ep: &EpochKernelParams) -> [u8; 64] {
     let mut acc = [0u64; 8];
-    for index in 0..8 {
-        acc[index] = state_u64(state, index);
-    }
+    for index in 0..8 { acc[index] = state_u64(state, index); }
+    let mix_c = ep.mix_constants[7];
+    let rot_off = ep.rot_offsets[7];
+    let stride = ep.stride_salt[7] as usize;
     let mut cursor = (acc[0] as usize) % page.len();
     for step in 0..64u64 {
         let value = read_u64_le(page, cursor);
         let slot = step as usize % 8;
+        let cross = ep.slot_perm[slot];
         match value & 0x07 {
             0 => {
                 acc[slot] = acc[slot].wrapping_add(value);
-                cursor = cursor.wrapping_add((value as usize).wrapping_mul(7)) % page.len();
+                cursor = cursor.wrapping_add((value as usize).wrapping_mul(stride)) % page.len();
             }
             1 => {
-                acc[slot] = acc[slot].wrapping_sub(value.rotate_left(13));
+                acc[slot] = acc[slot].wrapping_sub(value.rotate_left(rot_off & 63));
                 cursor = cursor.wrapping_add(acc[slot] as usize) % page.len();
             }
             2 => {
-                acc[slot] ^= value.wrapping_mul(0xBF58476D1CE4E5B9);
+                acc[slot] ^= value.wrapping_mul(mix_c);
                 cursor = cursor.wrapping_add(17 + step as usize) % page.len();
             }
             3 => {
@@ -463,36 +532,37 @@ fn kernel_branch_maze(page: &[u8], state: &[u8; 64]) -> [u8; 64] {
                 cursor = cursor.wrapping_add(div as usize) % page.len();
             }
             4 => {
-                acc[slot] = acc[slot].rotate_left((value & 63) as u32);
-                acc[(slot + 1) % 8] ^= value;
-                cursor = cursor.wrapping_add(acc[(slot + 1) % 8] as usize) % page.len();
+                acc[slot] = acc[slot].rotate_left(((value & 63) as u32).wrapping_add(rot_off) & 63);
+                acc[cross] ^= value;
+                cursor = cursor.wrapping_add(acc[cross] as usize) % page.len();
             }
             5 => {
                 acc[slot] = acc[slot].wrapping_add((value.count_ones() as u64).wrapping_mul(step));
-                cursor = cursor.wrapping_add(3 + value as usize) % page.len();
+                cursor = cursor.wrapping_add(stride + value as usize) % page.len();
             }
             6 => {
                 acc[slot] = (acc[slot] ^ value).reverse_bits();
                 cursor = cursor.wrapping_add(acc[slot] as usize) % page.len();
             }
             _ => {
-                acc[slot] = acc[slot]
-                    .wrapping_add(value)
-                    .wrapping_mul(0x94D049BB133111EB);
+                acc[slot] = acc[slot].wrapping_add(value).wrapping_mul(mix_c);
                 cursor = cursor.wrapping_add((value >> 8) as usize) % page.len();
             }
         }
+        // Epoch-dependent post-step diffusion
+        acc[slot] ^= mix_c.wrapping_mul(step.wrapping_add(1));
     }
     to_output(&acc)
 }
 
-fn kernel_aes_cascade(page: &[u8], state: &[u8; 64]) -> [u8; 64] {
+fn kernel_aes_cascade(page: &[u8], state: &[u8; 64], ep: &EpochKernelParams) -> [u8; 64] {
     let mut buf = [0u8; 64];
     buf.copy_from_slice(state);
+    let stride = ep.stride_salt[8] as usize;
     for round in 0..24u32 {
-        let page_off = (round as usize).wrapping_mul(197) % page.len().saturating_sub(64).max(1);
+        let page_off = (round as usize).wrapping_mul(stride) % page.len().saturating_sub(64).max(1);
         for i in 0..64 {
-            buf[i] = SBOX[buf[i] as usize];
+            buf[i] = ep.sbox[buf[i] as usize];
         }
         for lane in 0..4usize {
             let base = lane * 16;
@@ -522,13 +592,13 @@ fn kernel_aes_cascade(page: &[u8], state: &[u8; 64]) -> [u8; 64] {
     buf
 }
 
-fn kernel_float_emulate(page: &[u8], state: &[u8; 64]) -> [u8; 64] {
+fn kernel_float_emulate(page: &[u8], state: &[u8; 64], ep: &EpochKernelParams) -> [u8; 64] {
     let mut acc = [0u64; 8];
-    for index in 0..8 {
-        acc[index] = state_u64(state, index);
-    }
+    for index in 0..8 { acc[index] = state_u64(state, index); }
+    let stride = ep.stride_salt[9] as usize;
+    let mix_c = ep.mix_constants[9];
     for step in 0..64u64 {
-        let data = read_u64_le(page, (step as usize).wrapping_mul(73) % page.len());
+        let data = read_u64_le(page, (step as usize).wrapping_mul(stride) % page.len());
         let slot = step as usize % 8;
         let a_hi = (acc[slot] >> 32) as u32;
         let a_lo = acc[slot] as u32;
@@ -543,7 +613,7 @@ fn kernel_float_emulate(page: &[u8], state: &[u8; 64]) -> [u8; 64] {
         let refined = est.wrapping_mul(2u64.wrapping_sub(denom.wrapping_mul(est) >> 32));
         acc[slot] = mid ^ refined;
         acc[(slot + 3) % 8] = acc[(slot + 3) % 8].wrapping_add(
-            mid.wrapping_mul(0x517CC1B727220A95)
+            mid.wrapping_mul(mix_c)
                 .rotate_left((step as u32) & 63),
         );
         acc[(slot + 6) % 8] ^= refined.wrapping_sub(acc[slot]);
@@ -551,44 +621,41 @@ fn kernel_float_emulate(page: &[u8], state: &[u8; 64]) -> [u8; 64] {
     to_output(&acc)
 }
 
-fn kernel_scatter_gather(page: &[u8], state: &[u8; 64]) -> [u8; 64] {
+fn kernel_scatter_gather(page: &[u8], state: &[u8; 64], ep: &EpochKernelParams) -> [u8; 64] {
     let mut scratch = [0u8; 2048];
-    for index in 0..2048 {
-        scratch[index] = state[index % 64] ^ (index as u8).wrapping_mul(0x9D);
-    }
+    for index in 0..2048 { scratch[index] = state[index % 64] ^ (index as u8).wrapping_mul(0x9D); }
     let mut acc = [0u64; 8];
-    for index in 0..8 {
-        acc[index] = state_u64(state, index);
-    }
+    for index in 0..8 { acc[index] = state_u64(state, index); }
+    let mix_c = ep.mix_constants[10];
+    let rot_off = ep.rot_offsets[10];
     for step in 0..80u64 {
         let slot = step as usize % 8;
+        let cross = ep.slot_perm[slot];
         let page_idx = (acc[slot] as usize) % page.len().saturating_sub(7).max(1);
         let page_val = read_u64_le(page, page_idx);
         let scratch_idx = (page_val as usize) % (2048 - 7);
         let scratch_val = u64::from_le_bytes(
-            scratch[scratch_idx..scratch_idx + 8]
-                .try_into()
-                .expect("scratch slice"),
+            scratch[scratch_idx..scratch_idx + 8].try_into().expect("scratch slice"),
         );
         let mixed = page_val
             .wrapping_mul(scratch_val | 1)
-            .rotate_left((acc[(slot + 1) % 8] & 63) as u32);
+            .rotate_left(((acc[(slot + 1) % 8] & 63) as u32).wrapping_add(rot_off) & 63);
         acc[slot] = acc[slot].wrapping_add(mixed);
         let writeback_idx = (acc[slot] as usize) % (2048 - 7);
         scratch[writeback_idx..writeback_idx + 8].copy_from_slice(&acc[slot].to_le_bytes());
-        acc[(slot + 4) % 8] ^= acc[slot].wrapping_mul(0x2545F4914F6CDD1D);
+        acc[cross] ^= acc[slot].wrapping_mul(mix_c);
     }
     to_output(&acc)
 }
 
-fn kernel_mod_exp_chain(page: &[u8], state: &[u8; 64]) -> [u8; 64] {
+fn kernel_mod_exp_chain(page: &[u8], state: &[u8; 64], ep: &EpochKernelParams) -> [u8; 64] {
     let mut acc = [0u64; 8];
-    for index in 0..8 {
-        acc[index] = state_u64(state, index);
-    }
+    for index in 0..8 { acc[index] = state_u64(state, index); }
+    let stride = ep.stride_salt[11] as usize;
+    let mix_c = ep.mix_constants[11];
     for step in 0..56u64 {
         let slot = step as usize % 8;
-        let data = read_u64_le(page, (step as usize).wrapping_mul(89) % page.len());
+        let data = read_u64_le(page, (step as usize).wrapping_mul(stride) % page.len());
         let modulus = data.wrapping_add(acc[(slot + 2) % 8]) | 0x8000_0000_0000_0001;
         let mut base = acc[slot];
         let mut result = 1u64;
@@ -604,7 +671,7 @@ fn kernel_mod_exp_chain(page: &[u8], state: &[u8; 64]) -> [u8; 64] {
         acc[slot] = result;
         let remainder = acc[slot] % (data | 1);
         acc[(slot + 5) % 8] = acc[(slot + 5) % 8]
-            .wrapping_add(remainder)
+            .wrapping_add(remainder.wrapping_mul(mix_c))
             .rotate_left((step as u32) & 63);
     }
     to_output(&acc)

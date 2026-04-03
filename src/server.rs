@@ -31,6 +31,17 @@ const VARDIFF_RETARGET_SHARES: usize = 6;
 /// Initial low difficulty for new miners (ramps up quickly)
 const VARDIFF_INITIAL: u64 = 100;
 
+/// ── GTM: Graduated Trust Mining ──
+/// Number of shares during warmup phase — difficulty ramps exponentially
+/// from VARDIFF_INITIAL toward the estimated target.
+const GTM_WARMUP_SHARES: u64 = 100;
+/// Maximum connections from a single IP address
+const GTM_MAX_CONNECTIONS_PER_IP: usize = 32;
+
+/// Grace window duration for VarDiff transitions. Shares mined at any
+/// difficulty that was active within this window will be accepted.
+const VARDIFF_GRACE_WINDOW_SECS: u64 = 30;
+
 struct MinerSession {
     shares: u64,
     invalid_shares: u64,
@@ -41,6 +52,16 @@ struct MinerSession {
     /// The miner's view public key (32 bytes), used for coinbase output creation.
     #[allow(dead_code)]
     view_public: [u8; 32],
+    /// GTM: total shares submitted (for warmup ramp calculation)
+    total_lifetime_shares: u64,
+    /// GTM: estimated target difficulty once warmup completes
+    estimated_target_diff: u64,
+    /// Minimum difficulty within the grace window. Shares mined at any
+    /// difficulty >= this floor are accepted, preventing spurious rejections
+    /// when VarDiff ramps rapidly during GTM warmup.
+    difficulty_floor: u64,
+    /// When the difficulty floor was last set; resets after the grace window.
+    floor_set_at: std::time::Instant,
 }
 
 struct VarDiffState {
@@ -54,6 +75,46 @@ impl VarDiffState {
             current_difficulty: initial_difficulty,
             share_timestamps: VecDeque::with_capacity(VARDIFF_WINDOW + 1),
         }
+    }
+
+    /// GTM warmup difficulty: exponential ramp from VARDIFF_INITIAL toward
+    /// `target_diff` over `GTM_WARMUP_SHARES` submissions.
+    ///
+    /// d(n) = d_init + (d_target - d_init) · (1 - e^{-5n/W})
+    ///
+    /// At n=0:  d ≈ d_init
+    /// At n=W:  d ≈ 0.993 · d_target  (within 1% of target)
+    fn warmup_difficulty(total_shares: u64, target_diff: u64) -> u64 {
+        if total_shares >= GTM_WARMUP_SHARES {
+            return target_diff;
+        }
+        let ratio = 5.0 * total_shares as f64 / GTM_WARMUP_SHARES as f64;
+        let factor = 1.0 - (-ratio).exp();
+        let d_init = VARDIFF_INITIAL as f64;
+        let d_target = target_diff as f64;
+        let d = d_init + (d_target - d_init) * factor;
+        (d.max(VARDIFF_MIN as f64).min(VARDIFF_MAX as f64)) as u64
+    }
+
+    /// Record a share and return Some(new_diff) if adjustment is needed.
+    /// During GTM warmup, always returns the warmup-ramped difficulty.
+    fn record_share_with_warmup(
+        &mut self,
+        total_lifetime_shares: u64,
+        estimated_target: u64,
+    ) -> Option<u64> {
+        // During warmup, always return the exponentially ramped difficulty
+        if total_lifetime_shares < GTM_WARMUP_SHARES {
+            let warmup_diff = Self::warmup_difficulty(total_lifetime_shares, estimated_target);
+            if warmup_diff != self.current_difficulty {
+                self.current_difficulty = warmup_diff;
+                return Some(warmup_diff);
+            }
+            return None;
+        }
+
+        // Post-warmup: standard VarDiff behaviour
+        self.record_share()
     }
 
     /// Record a share and return Some(new_diff) if adjustment is needed.
@@ -128,6 +189,8 @@ pub struct PoolServer<T: TemplateProvider + Send + Sync + 'static> {
     job_tx: broadcast::Sender<PoolBroadcast>,
     miners: Arc<RwLock<HashMap<[u8; 32], MinerSession>>>,
     arena: Arc<RwLock<ArenaCache>>,
+    /// GTM: per-IP connection counts for rate limiting
+    ip_connections: Arc<RwLock<HashMap<std::net::IpAddr, usize>>>,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -172,6 +235,7 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
             job_tx,
             miners: Arc::new(RwLock::new(HashMap::new())),
             arena: Arc::new(RwLock::new(None)),
+            ip_connections: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -263,8 +327,26 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
 
         loop {
             let (stream, addr) = listener.accept().await?;
+
+            // ── GTM: per-IP connection limiting ──
+            {
+                let mut ip_map = self.ip_connections.write();
+                let count = ip_map.entry(addr.ip()).or_insert(0);
+                if *count >= GTM_MAX_CONNECTIONS_PER_IP {
+                    warn!(
+                        "GTM: rejecting connection from {addr}: {} connections already active from this IP",
+                        *count
+                    );
+                    drop(stream);
+                    continue;
+                }
+                *count += 1;
+            }
+
             info!("Miner connected from {addr}");
             let server = Arc::clone(&self);
+            let ip_connections = Arc::clone(&self.ip_connections);
+            let peer_ip = addr.ip();
             tokio::spawn(async move {
                 if let Err(e) = server.handle_connection(stream, addr).await {
                     match e {
@@ -277,6 +359,16 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                             info!("Miner {addr} disconnected: {other}");
                         }
                         other => warn!("Miner {addr} disconnected: {other}"),
+                    }
+                }
+                // GTM: decrement IP connection count on disconnect
+                {
+                    let mut ip_map = ip_connections.write();
+                    if let Some(count) = ip_map.get_mut(&peer_ip) {
+                        *count = count.saturating_sub(1);
+                        if *count == 0 {
+                            ip_map.remove(&peer_ip);
+                        }
                     }
                 }
             });
@@ -380,6 +472,10 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
         let initial_diff =
             Self::recommended_share_difficulty(login.estimated_hashrate, login.thread_count);
 
+        // GTM: new miners start at VARDIFF_INITIAL regardless of reported hashrate;
+        // the estimated target is stored so the warmup ramp has something to aim for.
+        let gtm_initial = VARDIFF_INITIAL;
+
         {
             let mut miners = self.miners.write();
             miners.insert(
@@ -387,10 +483,14 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                 MinerSession {
                     shares: 0,
                     invalid_shares: 0,
-                    vardiff: VarDiffState::new(initial_diff),
+                    vardiff: VarDiffState::new(gtm_initial),
                     thread_count: login.thread_count,
                     wallet_address: wallet_addr,
                     view_public,
+                    total_lifetime_shares: 0,
+                    estimated_target_diff: initial_diff,
+                    difficulty_floor: gtm_initial,
+                    floor_set_at: std::time::Instant::now(),
                 },
             );
         }
@@ -411,7 +511,7 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
             accepted: true,
             pool_id: self.pool_id.clone(),
             error: String::new(),
-            share_difficulty: initial_diff,
+            share_difficulty: gtm_initial,
             chain_tip_hash: tip_hash,
             chain_height: tip_height,
             block_difficulty: block_diff,
@@ -422,7 +522,7 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
         PoolCodec::write_envelope(&mut stream, &ack_env).await?;
 
         if let Some(job) = current_job {
-            let template = self.build_job_template_for_miner(&job, true, wallet_addr, initial_diff);
+            let template = self.build_job_template_for_miner(&job, true, wallet_addr, gtm_initial);
             let job_env = PoolEnvelope::sign(MSG_JOB, template.encode_to_vec(), &self.pool_key);
             PoolCodec::write_envelope(&mut stream, &job_env).await?;
         }
@@ -453,7 +553,30 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                                 let new_diff = {
                                     let mut miners = self.miners.write();
                                     if let Some(session) = miners.get_mut(&miner_pk) {
-                                        session.vardiff.record_share()
+                                        let old_diff = session.vardiff.current_difficulty;
+                                        session.total_lifetime_shares += 1;
+                                        let result = session.vardiff.record_share_with_warmup(
+                                            session.total_lifetime_shares,
+                                            session.estimated_target_diff,
+                                        );
+                                        if result.is_some() {
+                                            // Maintain the difficulty floor as the minimum of the
+                                            // old floor and the outgoing difficulty. This ensures
+                                            // all in-flight shares mined at any difficulty within
+                                            // the grace window are still accepted.
+                                            let now = std::time::Instant::now();
+                                            if now.duration_since(session.floor_set_at).as_secs()
+                                                >= VARDIFF_GRACE_WINDOW_SECS
+                                            {
+                                                // Grace window expired — reset floor to old_diff
+                                                session.difficulty_floor = old_diff;
+                                            } else {
+                                                session.difficulty_floor =
+                                                    session.difficulty_floor.min(old_diff);
+                                            }
+                                            session.floor_set_at = now;
+                                        }
+                                        result
                                     } else {
                                         None
                                     }
@@ -518,6 +641,16 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                                         let change_pct = (recommended as f64 - current as f64).abs()
                                             / current as f64;
                                         if change_pct >= 0.15 {
+                                            let now = std::time::Instant::now();
+                                            if now.duration_since(session.floor_set_at).as_secs()
+                                                >= VARDIFF_GRACE_WINDOW_SECS
+                                            {
+                                                session.difficulty_floor = current;
+                                            } else {
+                                                session.difficulty_floor =
+                                                    session.difficulty_floor.min(current);
+                                            }
+                                            session.floor_set_at = now;
                                             session.vardiff.current_difficulty = recommended;
                                             session.vardiff.share_timestamps.clear();
                                             Some(recommended)
@@ -692,7 +825,28 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
         let mut effective_header = job.header.clone();
         effective_header.miner_pubkey = reward_recipient;
 
-        let miner_share_diff = self.session_share_difficulty(miner_pk, job.share_difficulty);
+        // Use the difficulty floor as the effective share difficulty during
+        // VarDiff transitions. The floor tracks the minimum difficulty over a
+        // grace window, so in-flight shares mined at any recently-active
+        // difficulty are accepted rather than spuriously rejected.
+        let (_miner_share_diff, effective_share_diff) = {
+            let miners = self.miners.read();
+            if let Some(session) = miners.get(miner_pk) {
+                let cur = session.vardiff.current_difficulty;
+                let floor = if std::time::Instant::now()
+                    .duration_since(session.floor_set_at)
+                    .as_secs()
+                    < VARDIFF_GRACE_WINDOW_SECS
+                {
+                    session.difficulty_floor
+                } else {
+                    cur
+                };
+                (cur, cur.min(floor))
+            } else {
+                (job.share_difficulty, job.share_difficulty)
+            }
+        };
 
         let verdict = verify_share(
             &effective_header,
@@ -700,7 +854,7 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
             &extra_nonce,
             &arena,
             &self.cfg,
-            miner_share_diff,
+            effective_share_diff,
         );
 
         match verdict {
@@ -732,7 +886,7 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                 self.accounting.record_valid_share(
                     *miner_pk,
                     wallet_address,
-                    miner_share_diff,
+                    effective_share_diff,
                     effective_header.difficulty,
                     effective_header.reward,
                     effective_header.total_fee,
@@ -831,7 +985,7 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                 self.accounting.record_valid_share(
                     *miner_pk,
                     wallet_address,
-                    miner_share_diff,
+                    effective_share_diff,
                     effective_header.difficulty,
                     effective_header.reward,
                     effective_header.total_fee,
