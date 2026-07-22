@@ -54,6 +54,7 @@ pub struct PoolAccountingConfig {
     pub pool_fee_bps: u16,
     pub pool_wallet: [u8; 32],
     pub pool_view_public: [u8; 32],
+    pub network_magic: [u8; 4],
     pub pplns_window_factor: u32,
     pub state_dir: Option<PathBuf>,
 }
@@ -177,6 +178,7 @@ impl AccountingState {
 pub struct PoolAccounting {
     state: RwLock<AccountingState>,
     state_path: Option<PathBuf>,
+    network_magic: [u8; 4],
     /// Maps spend_public → view_public for all registered miners and the pool wallet.
     view_keys: RwLock<HashMap<[u8; 32], [u8; 32]>>,
 }
@@ -189,7 +191,7 @@ impl PoolAccounting {
             .map(|dir| dir.join("pool_accounting.bin"));
         let state = state_path
             .as_ref()
-            .and_then(|path| Self::load_state(path))
+            .and_then(|path| Self::load_state_with_backup(path))
             .unwrap_or_else(|| AccountingState::new(&config));
         let mut view_keys = HashMap::new();
         if config.pool_view_public != [0u8; 32] {
@@ -198,6 +200,7 @@ impl PoolAccounting {
         Self {
             state: RwLock::new(state),
             state_path,
+            network_magic: config.network_magic,
             view_keys: RwLock::new(view_keys),
         }
     }
@@ -207,7 +210,10 @@ impl PoolAccounting {
     }
 
     /// Parse a wallet address string and return `(view_public, spend_public)`.
-    pub fn parse_wallet_input(input: &str) -> Result<([u8; 32], [u8; 32]), String> {
+    pub fn parse_wallet_input(
+        input: &str,
+        network_magic: [u8; 4],
+    ) -> Result<([u8; 32], [u8; 32]), String> {
         if input.starts_with("hy1") {
             let encoded = &input[3..];
             let payload = bs58::decode(encoded)
@@ -223,6 +229,14 @@ impl PoolAccounting {
             if checksum.as_bytes()[..4] != payload[65..69] {
                 return Err("hy1 address checksum mismatch".into());
             }
+            let expected_version = match network_magic {
+                [0x48, 0x59, 0x50, 0x4e] => 0x01,
+                [0x48, 0x59, 0x54, 0x53] | [0x48, 0x59, 0x44, 0x56] => 0x02,
+                _ => return Err("unknown Hyphen network magic".into()),
+            };
+            if payload[0] != expected_version {
+                return Err("wallet address belongs to a different Hyphen network".into());
+            }
             let mut view_public = [0u8; 32];
             view_public.copy_from_slice(&payload[1..33]);
             let mut spend_public = [0u8; 32];
@@ -231,6 +245,10 @@ impl PoolAccounting {
         }
 
         Err("wallet must be a hy1... address".into())
+    }
+
+    pub fn decode_wallet(&self, input: &str) -> Result<([u8; 32], [u8; 32]), String> {
+        Self::parse_wallet_input(input, self.network_magic)
     }
 
     pub fn pool_wallet(&self) -> [u8; 32] {
@@ -480,6 +498,20 @@ impl PoolAccounting {
         let now = now_secs();
         {
             let mut state = self.state.write();
+            if let Some(latest) = state.recent_blocks.last() {
+                if height <= latest.height
+                    || state
+                        .recent_blocks
+                        .iter()
+                        .any(|block| block.block_hash_hex == block_hash_hex)
+                {
+                    warn!(
+                        "Ignored duplicate or out-of-order block settlement: height={}, hash={}",
+                        height, block_hash_hex
+                    );
+                    return;
+                }
+            }
             let gross_block_reward = block_reward_atomic as u128;
             let gross_total = gross_block_reward + total_fee_atomic as u128;
             let finder_key = hex::encode(finder_pubkey);
@@ -737,6 +769,21 @@ impl PoolAccounting {
         serde_json::from_str(text).ok()
     }
 
+    fn load_state_with_backup(path: &Path) -> Option<AccountingState> {
+        if let Some(state) = Self::load_state(path) {
+            return Some(state);
+        }
+        let backup = persistence_sidecar(path, "bak");
+        let recovered = Self::load_state(&backup);
+        if recovered.is_some() {
+            warn!(
+                "Recovered pool accounting state from {} after primary-state failure",
+                backup.display()
+            );
+        }
+        recovered
+    }
+
     fn save_if_needed(&self, force: bool) {
         if !force {
             return;
@@ -756,13 +803,48 @@ impl PoolAccounting {
         let state = self.state.read().clone();
         match bincode::serialize(&state) {
             Ok(bytes) => {
-                if let Err(error) = std::fs::write(path, bytes) {
-                    warn!("Failed to persist pool accounting state: {error}");
+                let temporary = persistence_sidecar(path, "next");
+                let backup = persistence_sidecar(path, "bak");
+                let write_result = (|| -> Result<(), std::io::Error> {
+                    use std::io::Write;
+
+                    let mut file = std::fs::OpenOptions::new()
+                        .create(true)
+                        .truncate(true)
+                        .write(true)
+                        .open(&temporary)?;
+                    file.write_all(&bytes)?;
+                    file.sync_all()?;
+
+                    if path.exists() {
+                        if backup.exists() {
+                            std::fs::remove_file(&backup)?;
+                        }
+                        std::fs::rename(path, &backup)?;
+                    }
+                    if let Err(error) = std::fs::rename(&temporary, path) {
+                        if !path.exists() && backup.exists() {
+                            let _ = std::fs::rename(&backup, path);
+                        }
+                        return Err(error);
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = write_result {
+                    warn!("Failed to atomically persist pool accounting state: {error}");
                 }
             }
             Err(error) => warn!("Failed to serialize pool accounting state: {error}"),
         }
     }
+}
+
+fn persistence_sidecar(path: &Path, suffix: &str) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("pool_accounting.bin");
+    path.with_file_name(format!("{file_name}.{suffix}"))
 }
 
 fn proportional_credit(share_difficulty: u64, block_difficulty: u64, amount: u128) -> u128 {
@@ -798,6 +880,8 @@ mod tests {
             mode: PoolMode::Prop,
             pool_fee_bps: 100,
             pool_wallet: [9u8; 32],
+            pool_view_public: [0u8; 32],
+            network_magic: [0x48, 0x59, 0x54, 0x53],
             pplns_window_factor: 2,
             state_dir: None,
         }
@@ -815,10 +899,133 @@ mod tests {
         accounting.record_valid_share(miner_a, wallet, 100, 1_000, 500, 0);
         accounting.record_valid_share(miner_b, wallet, 50, 1_000, 500, 0);
 
+        let before_settlement = accounting.wallet_summary(wallet, 8);
+        assert_eq!(before_settlement.pending_payout_atomic, 0);
+
+        accounting.settle_block(miner_a, wallet, 1, "01".repeat(32), 500, 0, 1_000);
+
         let summary = accounting.wallet_summary(wallet, 8);
         assert_eq!(summary.wallet_address, wallet);
         assert_eq!(summary.active_miners, 2);
         assert_eq!(summary.valid_shares, 2);
         assert!(summary.pending_payout_atomic > 0);
+    }
+
+    #[test]
+    fn rejects_wallet_from_another_network() {
+        let mut payload = vec![0x01];
+        payload.extend_from_slice(&[7u8; 32]);
+        payload.extend_from_slice(&[8u8; 32]);
+        let checksum = blake3::hash(&payload);
+        payload.extend_from_slice(&checksum.as_bytes()[..4]);
+        let address = format!("hy1{}", bs58::encode(payload).into_string());
+
+        let error =
+            PoolAccounting::parse_wallet_input(&address, [0x48, 0x59, 0x54, 0x53]).unwrap_err();
+        assert!(error.contains("different Hyphen network"));
+    }
+
+    #[test]
+    fn accepts_test_address_on_devnet() {
+        let mut payload = vec![0x02];
+        payload.extend_from_slice(&[7u8; 32]);
+        payload.extend_from_slice(&[8u8; 32]);
+        let checksum = blake3::hash(&payload);
+        payload.extend_from_slice(&checksum.as_bytes()[..4]);
+        let address = format!("hy1{}", bs58::encode(payload).into_string());
+
+        let (view_public, spend_public) =
+            PoolAccounting::parse_wallet_input(&address, [0x48, 0x59, 0x44, 0x56]).unwrap();
+        assert_eq!(view_public, [7u8; 32]);
+        assert_eq!(spend_public, [8u8; 32]);
+    }
+
+    #[test]
+    fn recovers_last_committed_ledger_after_primary_corruption() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "hyphen_pool_fault_injection_{}_{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let mut config = sample_config();
+        config.state_dir = Some(test_dir.clone());
+        let first_miner = [31u8; 32];
+        let second_miner = [32u8; 32];
+        let wallet = [33u8; 32];
+
+        {
+            let accounting = PoolAccounting::new(config.clone());
+            accounting.register_miner(first_miner, wallet);
+            accounting.register_miner(second_miner, wallet);
+        }
+
+        let primary = test_dir.join("pool_accounting.bin");
+        std::fs::write(&primary, b"fault-injected-truncated-state").unwrap();
+
+        let recovered = PoolAccounting::new(config);
+        assert!(recovered.miner_ledger(&first_miner).is_some());
+        assert!(recovered.miner_ledger(&second_miner).is_none());
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn duplicate_block_settlement_is_idempotent() {
+        let mut config = sample_config();
+        config.mode = PoolMode::Solo;
+        config.pool_fee_bps = 0;
+        let accounting = PoolAccounting::new(config);
+        let miner = [41u8; 32];
+        let wallet = [42u8; 32];
+
+        accounting.register_miner(miner, wallet);
+        accounting.record_valid_share(miner, wallet, 1, 1_000, 500, 5);
+        accounting.settle_block(miner, wallet, 7, "ab".repeat(32), 500, 5, 1_000);
+        accounting.settle_block(miner, wallet, 7, "ab".repeat(32), 500, 5, 1_000);
+
+        let summary = accounting.wallet_summary(wallet, 8);
+        assert_eq!(summary.total_blocks_found, 1);
+        assert_eq!(summary.direct_reward_atomic, 505);
+        assert_eq!(summary.recent_blocks.len(), 1);
+        assert_eq!(summary.recent_reward_events.len(), 1);
+    }
+
+    #[test]
+    fn pplns_excludes_old_work_after_trailing_target_is_met() {
+        let mut config = sample_config();
+        config.mode = PoolMode::Pplns;
+        config.pool_fee_bps = 0;
+        config.pplns_window_factor = 1;
+        let accounting = PoolAccounting::new(config);
+        let old_miner = [51u8; 32];
+        let recent_a = [52u8; 32];
+        let recent_b = [53u8; 32];
+
+        accounting.record_valid_share(old_miner, old_miner, 100, 100, 1_000, 0);
+        accounting.record_valid_share(recent_a, recent_a, 60, 100, 1_000, 0);
+        accounting.record_valid_share(recent_b, recent_b, 40, 100, 1_000, 0);
+        accounting.settle_block(recent_b, recent_b, 1, "cd".repeat(32), 1_000, 0, 100);
+
+        assert_eq!(
+            accounting
+                .miner_ledger(&old_miner)
+                .unwrap()
+                .pending_payout_atomic,
+            0
+        );
+        assert_eq!(
+            accounting
+                .miner_ledger(&recent_a)
+                .unwrap()
+                .pending_payout_atomic,
+            600
+        );
+        assert_eq!(
+            accounting
+                .miner_ledger(&recent_b)
+                .unwrap()
+                .pending_payout_atomic,
+            400
+        );
     }
 }

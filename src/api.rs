@@ -210,7 +210,7 @@ async fn wallet_balance(
     Path(wallet): Path<String>,
     Query(query): Query<WalletBalanceQuery>,
 ) -> impl IntoResponse {
-    let wallet_address = match PoolAccounting::parse_wallet_input(wallet.trim()) {
+    let wallet_address = match state.accounting.decode_wallet(wallet.trim()) {
         Ok((_view, spend)) => spend,
         Err(error) => return error_json(StatusCode::BAD_REQUEST, error).into_response(),
     };

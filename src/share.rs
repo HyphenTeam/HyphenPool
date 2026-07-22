@@ -3,7 +3,7 @@ use crate::primitives::{BlockHeader, ChainConfig, Hash256};
 
 #[derive(Debug)]
 pub enum ShareVerdict {
-    ValidShare,
+    ValidShare { hash: Hash256 },
     BlockFound { hash: Hash256 },
     Invalid(String),
 }
@@ -29,7 +29,7 @@ pub fn verify_share(
 
     let share_target = difficulty_to_target(share_difficulty);
     if hash_below_target(&hash, &share_target) {
-        return ShareVerdict::ValidShare;
+        return ShareVerdict::ValidShare { hash };
     }
 
     ShareVerdict::Invalid("hash does not meet share difficulty".into())
@@ -57,7 +57,7 @@ mod tests {
         let arena = EpochArena::generate(epoch_seed, cfg.arena_size, cfg.page_size);
 
         let header = BlockHeader {
-            version: 1,
+            version: crate::primitives::FROZEN_BLOCK_VERSION,
             height: 1,
             timestamp: 1_750_000_012,
             prev_hash: Hash256::ZERO,

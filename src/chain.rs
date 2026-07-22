@@ -90,13 +90,13 @@ impl ChainState {
         let bin_path = dir.join("chain_state.bin");
         let json_path = dir.join("chain_state.json");
         let loaded = if bin_path.exists() {
-            std::fs::read(&bin_path).ok().and_then(|raw| {
-                bincode::deserialize::<PersistedState>(&raw).ok()
-            })
+            std::fs::read(&bin_path)
+                .ok()
+                .and_then(|raw| bincode::deserialize::<PersistedState>(&raw).ok())
         } else if json_path.exists() {
-            std::fs::read_to_string(&json_path).ok().and_then(|data| {
-                serde_json::from_str::<PersistedState>(&data).ok()
-            })
+            std::fs::read_to_string(&json_path)
+                .ok()
+                .and_then(|data| serde_json::from_str::<PersistedState>(&data).ok())
         } else {
             None
         };
@@ -191,7 +191,7 @@ impl ChainState {
         let reward = self.calculate_reward(next_height);
 
         let header = BlockHeader {
-            version: 1,
+            version: crate::primitives::FROZEN_BLOCK_VERSION,
             height: next_height,
             timestamp: chrono::Utc::now().timestamp() as u64,
             prev_hash: tip.hash,
@@ -233,6 +233,10 @@ impl ChainState {
             arena_size: self.cfg.arena_size as u64,
             page_size: self.cfg.page_size as u64,
             clean: true,
+            network_magic: self.cfg.network_magic.to_vec(),
+            protocol_version: 2,
+            consensus_params_hash: self.cfg.consensus_params_hash().to_vec(),
+            genesis_hash: self.cfg.genesis_hash().to_vec(),
         }
     }
 

@@ -77,7 +77,17 @@ impl SignedEnvelope {
         let sig = Signature(sig_bytes);
         let to_sign = Self::sign_payload(self.msg_type, &self.payload, self.timestamp, self.nonce);
         pk.verify(&to_sign, &sig)
-            .map_err(|_| TPError::SignatureFailed)
+            .map_err(|_| TPError::SignatureFailed)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(0);
+        if self.timestamp > now.saturating_add(30_000)
+            || now > self.timestamp.saturating_add(120_000)
+        {
+            return Err(TPError::Protocol("stale envelope timestamp".into()));
+        }
+        Ok(())
     }
 
     fn sign_payload(msg_type: u32, payload: &[u8], timestamp: u64, nonce: u64) -> Vec<u8> {
@@ -94,6 +104,14 @@ impl SignedEnvelope {
 pub struct TemplateRequest {
     #[prost(bytes = "vec", tag = "1")]
     pub requester_pubkey: Vec<u8>,
+    #[prost(bytes = "vec", tag = "2")]
+    pub network_magic: Vec<u8>,
+    #[prost(uint32, tag = "3")]
+    pub protocol_version: u32,
+    #[prost(bytes = "vec", tag = "4")]
+    pub consensus_params_hash: Vec<u8>,
+    #[prost(bytes = "vec", tag = "5")]
+    pub genesis_hash: Vec<u8>,
 }
 
 #[derive(Clone, prost::Message)]
@@ -122,6 +140,14 @@ pub struct BlockTemplate {
     pub page_size: u64,
     #[prost(bool, tag = "12")]
     pub clean: bool,
+    #[prost(bytes = "vec", tag = "13")]
+    pub network_magic: Vec<u8>,
+    #[prost(uint32, tag = "14")]
+    pub protocol_version: u32,
+    #[prost(bytes = "vec", tag = "15")]
+    pub consensus_params_hash: Vec<u8>,
+    #[prost(bytes = "vec", tag = "16")]
+    pub genesis_hash: Vec<u8>,
 }
 
 #[derive(Clone, prost::Message)]
@@ -166,7 +192,7 @@ pub async fn read_envelope<R: AsyncReadExt + Unpin>(
     reader: &mut R,
 ) -> Result<SignedEnvelope, TPError> {
     let len = reader.read_u32().await?;
-    if len > 64 * 1024 * 1024 {
+    if len > 8 * 1024 * 1024 {
         return Err(TPError::Protocol(format!("envelope too large: {len}")));
     }
     let mut buf = vec![0u8; len as usize];

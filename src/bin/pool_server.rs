@@ -18,7 +18,7 @@ use hyphen_pool::tp::TemplateProvider;
 #[derive(Parser, Debug)]
 #[command(
     name = "hyphen-pool-server",
-    about = "Production mining pool server for the Hyphen blockchain"
+    about = "Mining pool server for the Hyphen blockchain"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -44,9 +44,13 @@ struct Cli {
     #[arg(long, default_value = "100")]
     share_difficulty: u64,
 
-    /// Network selection (mainnet | testnet)
-    #[arg(long, default_value = "testnet")]
+    /// Network selection (mainnet | testnet | devnet)
+    #[arg(long, value_parser = ["mainnet", "testnet", "devnet"], default_value = "devnet")]
     network: String,
+
+    /// Confirms that non-SOLO mainnet balances require an external payout process.
+    #[arg(long)]
+    acknowledge_manual_payouts: bool,
 
     /// Pool identifier
     #[arg(long, default_value = "hyphen-pool/0.1")]
@@ -68,9 +72,10 @@ struct Cli {
     #[arg(long, default_value = "pool_state")]
     pool_state_dir: String,
 
-    /// Disable Stratum V1 server
+    /// Enable the legacy share-only Stratum V1 test adapter. It cannot submit
+    /// frozen-v2 blocks and is forbidden on mainnet.
     #[arg(long)]
-    no_stratum: bool,
+    enable_legacy_stratum: bool,
 
     /// Disable pool accounting HTTP API
     #[arg(long)]
@@ -88,8 +93,8 @@ struct Cli {
     #[arg(long, default_value_t = 2)]
     pplns_window_factor: u32,
 
-    /// 32-byte hex-encoded wallet public key for receiving block rewards.
-    /// If not specified, the pool's signing key is used as the reward key.
+    /// A network-correct hy1... wallet address for shared-pool rewards.
+    /// In SOLO mode the miner's authorized address receives the coinbase.
     #[arg(long, default_value = "")]
     pool_wallet: String,
 }
@@ -126,8 +131,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cfg = match cli.network.as_str() {
         "mainnet" => ChainConfig::mainnet(),
-        _ => ChainConfig::testnet(),
+        "testnet" => ChainConfig::testnet(),
+        "devnet" => ChainConfig::devnet(),
+        _ => unreachable!("clap validates network"),
     };
+
+    if cli.share_difficulty == 0 {
+        return Err("--share-difficulty must be greater than zero".into());
+    }
+    if cli.pool_fee_bps.unwrap_or(0) > 10_000 {
+        return Err("--pool-fee-bps cannot exceed 10000".into());
+    }
+    if cli.pplns_window_factor == 0 {
+        return Err("--pplns-window-factor must be greater than zero".into());
+    }
+    if cli.network == "mainnet" {
+        if cli.standalone {
+            return Err("standalone pool mode is a test harness and is disabled on mainnet".into());
+        }
+        if cli.key_file.is_empty() || cli.pool_wallet.is_empty() {
+            return Err("mainnet pools require both --key-file and --pool-wallet".into());
+        }
+        if cli.payout_mode != PoolMode::Solo && !cli.acknowledge_manual_payouts {
+            return Err(
+                "shared mainnet payout modes require --acknowledge-manual-payouts because automatic on-chain settlement is not implemented"
+                    .into(),
+            );
+        }
+        if cli.enable_legacy_stratum {
+            return Err("legacy Stratum is disabled on mainnet because it cannot carry miner block authorization".into());
+        }
+    }
 
     let sk = if cli.key_file.is_empty() {
         let sk = SecretKey::generate();
@@ -163,7 +197,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (pool_view_public, pool_pubkey) = if cli.pool_wallet.is_empty() {
         ([0u8; 32], *sk.public_key().as_bytes())
     } else {
-        PoolAccounting::parse_wallet_input(&cli.pool_wallet)?
+        PoolAccounting::parse_wallet_input(&cli.pool_wallet, cfg.network_magic)?
     };
     let pool_fee_bps = cli
         .pool_fee_bps
@@ -179,6 +213,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         pool_fee_bps,
         pool_wallet: pool_pubkey,
         pool_view_public,
+        network_magic: cfg.network_magic,
         pplns_window_factor: cli.pplns_window_factor,
         state_dir: Some(PathBuf::from(&cli.pool_state_dir)),
     }));
@@ -266,7 +301,7 @@ async fn run_with_node(
     info!("Connecting to node TP at {} …", cli.node);
 
     let tp = Arc::new(
-        TemplateProviderClient::connect(&cli.node, &sk)
+        TemplateProviderClient::connect(&cli.node, &sk, &cfg)
             .await
             .map_err(|e| format!("Failed to connect to node TP: {e}"))?,
     );
@@ -318,7 +353,7 @@ async fn start_pool_and_stratum<T: TemplateProvider + Send + Sync + 'static>(
         tokio::spawn(async move { p.run().await })
     };
 
-    let stratum_handle = if !cli.no_stratum {
+    let stratum_handle = if cli.enable_legacy_stratum {
         let stratum = Arc::new(StratumServer::new(
             Arc::clone(&job_manager),
             Arc::clone(&tp),

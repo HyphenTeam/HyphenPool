@@ -2,7 +2,7 @@ use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use tracing::info;
 
-use crate::primitives::{blake3_hash_many, BlockHeader, Hash256};
+use crate::primitives::{BlockHeader, Hash256};
 use crate::tp::BlockTemplate;
 
 #[derive(Clone)]
@@ -44,17 +44,14 @@ impl JobManager {
         let header: BlockHeader = bincode::deserialize(&tpl.header_data)
             .map_err(|e| format!("header deserialise: {e}"))?;
 
-        let mut template_id = [0u8; 32];
-        if tpl.template_id.len() == 32 {
-            template_id.copy_from_slice(&tpl.template_id);
-        } else {
-            let id = blake3_hash_many(&[
-                &tpl.height.to_le_bytes(),
-                &tpl.difficulty.to_le_bytes(),
-                &tpl.prev_hash,
-            ]);
-            template_id = *id.as_bytes();
+        if tpl.template_id.len() != 32 {
+            return Err("template id must be exactly 32 bytes".into());
         }
+        if tpl.epoch_seed.len() != 32 {
+            return Err("template epoch seed must be exactly 32 bytes".into());
+        }
+        let mut template_id = [0u8; 32];
+        template_id.copy_from_slice(&tpl.template_id);
 
         {
             let current = self.current_job.read();
@@ -65,11 +62,12 @@ impl JobManager {
             }
         }
 
-        let epoch_seed = if tpl.epoch_seed.len() == 32 {
-            Hash256::from_bytes(tpl.epoch_seed.clone().try_into().unwrap())
-        } else {
-            Hash256::ZERO
-        };
+        let epoch_seed = Hash256::from_bytes(
+            tpl.epoch_seed
+                .as_slice()
+                .try_into()
+                .map_err(|_| "template epoch seed must be exactly 32 bytes")?,
+        );
 
         let job = ActiveJob {
             job_id: template_id,

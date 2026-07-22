@@ -6,6 +6,35 @@ use std::time::Duration;
 use thiserror::Error;
 use zeroize::Zeroize;
 
+pub const FROZEN_BLOCK_VERSION: u32 = 2;
+pub const BLOCK_AUTHORIZATION_VERSION: u16 = 1;
+const AUTHORIZATION_DOMAIN: &[u8] = b"Hyphen/NCAP/block-authorization/v1";
+
+pub const MAINNET_CONSENSUS_PARAMS_HASH: [u8; 32] = [
+    0xeb, 0x77, 0x36, 0x0a, 0x33, 0xbd, 0x56, 0x09, 0x45, 0x19, 0x65, 0x90, 0xb9, 0xfe, 0x4d, 0x9a,
+    0xef, 0x88, 0x89, 0x72, 0xd9, 0xa6, 0xa9, 0x47, 0x5e, 0x0b, 0xc4, 0xdb, 0x52, 0x0f, 0x95, 0x57,
+];
+pub const MAINNET_GENESIS_HASH: [u8; 32] = [
+    0xfc, 0xc9, 0x1f, 0x7a, 0x75, 0x37, 0xb8, 0x4f, 0x8e, 0xf1, 0x75, 0x7d, 0x56, 0xba, 0xc7, 0x5d,
+    0x1f, 0xc0, 0xd1, 0x8a, 0xa1, 0x54, 0x07, 0x26, 0xc6, 0x1d, 0xb4, 0x9a, 0xc8, 0x99, 0x1c, 0x9e,
+];
+pub const TESTNET_CONSENSUS_PARAMS_HASH: [u8; 32] = [
+    0x9b, 0x5a, 0x78, 0x1f, 0x5e, 0xe6, 0x47, 0xbc, 0xef, 0x6b, 0x14, 0x81, 0xb6, 0x84, 0xbb, 0xd3,
+    0xdf, 0x27, 0x71, 0x18, 0xd7, 0x88, 0x7e, 0x9a, 0xe4, 0x9d, 0xb1, 0x8d, 0x50, 0x7c, 0x2b, 0xda,
+];
+pub const TESTNET_GENESIS_HASH: [u8; 32] = [
+    0xd5, 0x14, 0x38, 0xcd, 0xc8, 0x36, 0x4e, 0x9d, 0x0a, 0x13, 0x9f, 0x73, 0x12, 0x96, 0xd3, 0xa3,
+    0x38, 0x45, 0xc1, 0xbb, 0x5f, 0x4b, 0x0a, 0x7c, 0xd1, 0xfa, 0x13, 0xeb, 0xce, 0x2a, 0xe7, 0x8f,
+];
+pub const DEVNET_CONSENSUS_PARAMS_HASH: [u8; 32] = [
+    0xe9, 0x59, 0x14, 0x68, 0xe6, 0xb5, 0x3e, 0x92, 0x2b, 0x67, 0xf6, 0xdb, 0xec, 0xd0, 0xdc, 0xce,
+    0xc4, 0x21, 0x7e, 0x95, 0xf0, 0xf0, 0x9a, 0x21, 0xbc, 0xe7, 0x24, 0x4f, 0xbe, 0x8e, 0x83, 0x22,
+];
+pub const DEVNET_GENESIS_HASH: [u8; 32] = [
+    0x4e, 0xe1, 0x46, 0xf6, 0x3e, 0xc5, 0x4d, 0xed, 0x2e, 0xd7, 0x43, 0xe8, 0x8e, 0xe4, 0xff, 0x09,
+    0x81, 0x59, 0x8a, 0xfc, 0x04, 0x12, 0xd4, 0x26, 0x1e, 0x17, 0xe4, 0x3a, 0x73, 0x1a, 0x1b, 0x92,
+];
+
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
 pub struct Hash256(pub [u8; 32]);
 
@@ -190,11 +219,29 @@ impl ChainConfig {
         self.block_time.as_millis() as u64
     }
 
+    pub fn consensus_params_hash(&self) -> [u8; 32] {
+        match self.network_magic {
+            [0x48, 0x59, 0x50, 0x4e] => MAINNET_CONSENSUS_PARAMS_HASH,
+            [0x48, 0x59, 0x54, 0x53] => TESTNET_CONSENSUS_PARAMS_HASH,
+            [0x48, 0x59, 0x44, 0x56] => DEVNET_CONSENSUS_PARAMS_HASH,
+            _ => [0u8; 32],
+        }
+    }
+
+    pub fn genesis_hash(&self) -> [u8; 32] {
+        match self.network_magic {
+            [0x48, 0x59, 0x50, 0x4e] => MAINNET_GENESIS_HASH,
+            [0x48, 0x59, 0x54, 0x53] => TESTNET_GENESIS_HASH,
+            [0x48, 0x59, 0x44, 0x56] => DEVNET_GENESIS_HASH,
+            _ => [0u8; 32],
+        }
+    }
+
     pub fn mainnet() -> Self {
         Self {
             network_name: "hyphen-mainnet".into(),
             network_magic: [0x48, 0x59, 0x50, 0x4E],
-            block_time: Duration::from_secs(12),
+            block_time: Duration::from_secs(60),
             epoch_length: 2048,
             arena_size: 2 * 1024 * 1024 * 1024,
             scratchpad_size: 8 * 1024 * 1024,
@@ -207,11 +254,11 @@ impl ChainConfig {
             difficulty_window: 60,
             genesis_difficulty: 1_000_000,
             max_block_size: 2 * 1024 * 1024,
-            initial_reward: 17_592_186_044_416,
-            tail_emission: 300_000_000_000,
+            initial_reward: 100_000_000_000_000,
+            tail_emission: 600_000_000_000,
             fee_burn_bps: 5000,
             tail_emission_height: 0,
-            emission_half_life: 262_144,
+            emission_half_life: 1_048_576,
             max_uncles: 2,
             max_uncle_depth: 7,
             uncle_reward_numerator: 7,
@@ -220,7 +267,7 @@ impl ChainConfig {
             nephew_reward_denominator: 32,
             difficulty_clamp_up: 3,
             difficulty_clamp_down: 3,
-            timestamp_future_limit_ms: 24_000,
+            timestamp_future_limit_ms: 120_000,
             min_ring_span: 100,
         }
     }
@@ -229,7 +276,7 @@ impl ChainConfig {
         Self {
             network_name: "hyphen-testnet".into(),
             network_magic: [0x48, 0x59, 0x54, 0x53],
-            block_time: Duration::from_secs(6),
+            block_time: Duration::from_secs(30),
             epoch_length: 128,
             arena_size: 64 * 1024 * 1024,
             scratchpad_size: 256 * 1024,
@@ -242,11 +289,11 @@ impl ChainConfig {
             difficulty_window: 30,
             genesis_difficulty: 1000,
             max_block_size: 2 * 1024 * 1024,
-            initial_reward: 17_592_186_044_416,
-            tail_emission: 300_000_000_000,
+            initial_reward: 100_000_000_000_000,
+            tail_emission: 600_000_000_000,
             fee_burn_bps: 5000,
             tail_emission_height: 0,
-            emission_half_life: 1024,
+            emission_half_life: 4_096,
             max_uncles: 2,
             max_uncle_depth: 7,
             uncle_reward_numerator: 7,
@@ -255,9 +302,23 @@ impl ChainConfig {
             nephew_reward_denominator: 32,
             difficulty_clamp_up: 3,
             difficulty_clamp_down: 3,
-            timestamp_future_limit_ms: 12_000,
+            timestamp_future_limit_ms: 60_000,
             min_ring_span: 20,
         }
+    }
+
+    pub fn devnet() -> Self {
+        let mut cfg = Self::testnet();
+        cfg.network_name = "hyphen-devnet-v1".into();
+        cfg.network_magic = [0x48, 0x59, 0x44, 0x56];
+        cfg.max_uncles = 0;
+        cfg.max_uncle_depth = 0;
+        cfg.uncle_reward_numerator = 0;
+        cfg.uncle_reward_denominator = 1;
+        cfg.nephew_reward_numerator = 0;
+        cfg.nephew_reward_denominator = 1;
+        cfg.min_ring_span = 0;
+        cfg
     }
 }
 
@@ -300,11 +361,75 @@ pub struct Block {
     pub header: BlockHeader,
     pub transactions: Vec<Vec<u8>>,
     pub uncle_headers: Vec<BlockHeader>,
-    pub pq_signature: Vec<u8>,
+    pub block_authorization: Vec<u8>,
 }
 
 impl Block {
     pub fn hash(&self) -> Hash256 {
         self.header.hash()
     }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BlockAuthorization {
+    pub version: u16,
+    pub reward_view_public: [u8; 32],
+    pub reward_spend_public: [u8; 32],
+    pub miner_signature: Vec<u8>,
+}
+
+impl BlockAuthorization {
+    pub fn verify(&self, header: &BlockHeader, cfg: &ChainConfig) -> Result<(), String> {
+        if header.version != FROZEN_BLOCK_VERSION {
+            return Err(format!("unsupported block version {}", header.version));
+        }
+        if self.version != BLOCK_AUTHORIZATION_VERSION {
+            return Err(format!(
+                "unsupported block authorization version {}",
+                self.version
+            ));
+        }
+        if header.miner_pubkey == [0u8; 32]
+            || self.reward_view_public == [0u8; 32]
+            || self.reward_spend_public == [0u8; 32]
+        {
+            return Err("authorization contains a zero public key".into());
+        }
+        let signature: [u8; 64] = self
+            .miner_signature
+            .as_slice()
+            .try_into()
+            .map_err(|_| "miner signature must be exactly 64 bytes")?;
+        let digest = authorization_digest(
+            header,
+            cfg.network_magic,
+            cfg.consensus_params_hash(),
+            cfg.genesis_hash(),
+            self.reward_view_public,
+            self.reward_spend_public,
+        );
+        PublicKey(header.miner_pubkey)
+            .verify(digest.as_bytes(), &Signature(signature))
+            .map_err(|_| "miner block authorization signature is invalid".into())
+    }
+}
+
+pub fn authorization_digest(
+    header: &BlockHeader,
+    network_magic: [u8; 4],
+    consensus_params_hash: [u8; 32],
+    genesis_hash: [u8; 32],
+    reward_view_public: [u8; 32],
+    reward_spend_public: [u8; 32],
+) -> Hash256 {
+    blake3_hash_many(&[
+        AUTHORIZATION_DOMAIN,
+        &BLOCK_AUTHORIZATION_VERSION.to_le_bytes(),
+        &network_magic,
+        &consensus_params_hash,
+        &genesis_hash,
+        header.hash().as_bytes(),
+        &reward_view_public,
+        &reward_spend_public,
+    ])
 }

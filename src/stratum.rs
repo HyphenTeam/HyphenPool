@@ -13,7 +13,7 @@ use tracing::{error, info, warn};
 use crate::accounting::PoolAccounting;
 use crate::job::{ActiveJob, JobManager};
 use crate::pow::EpochArena;
-use crate::primitives::{Block, ChainConfig, Hash256};
+use crate::primitives::{ChainConfig, Hash256};
 use crate::share::{verify_share, ShareVerdict};
 use crate::tp::TemplateProvider;
 
@@ -274,7 +274,8 @@ impl<T: TemplateProvider + Send + Sync + 'static> StratumServer<T> {
                     .unwrap_or("anon")
                     .to_string();
                 let wallet_spec = worker.split('.').next().unwrap_or("");
-                let (view_public, wallet_address) = match PoolAccounting::parse_wallet_input(wallet_spec) {
+                let (view_public, wallet_address) = match self.accounting.decode_wallet(wallet_spec)
+                {
                     Ok(keys) => keys,
                     Err(error) => {
                         return Ok(Some(JsonRpcResponse {
@@ -293,7 +294,8 @@ impl<T: TemplateProvider + Send + Sync + 'static> StratumServer<T> {
                         ses.authorized = true;
                     }
                 }
-                self.accounting.register_view_key(wallet_address, view_public);
+                self.accounting
+                    .register_view_key(wallet_address, view_public);
                 self.accounting
                     .register_miner(wallet_address, wallet_address);
                 info!("Stratum worker authorized: {worker}");
@@ -413,85 +415,17 @@ impl<T: TemplateProvider + Send + Sync + 'static> StratumServer<T> {
 
         match verdict {
             ShareVerdict::BlockFound { hash } => {
-                if !self.job_manager.try_begin_block_submission(job.job_id) {
-                    return fail(21, "stale job");
-                }
-
-                self.accounting.record_valid_share(
-                    wallet_address,
-                    wallet_address,
-                    job.share_difficulty,
-                    effective_header.difficulty,
-                    effective_header.reward,
-                    effective_header.total_fee,
+                warn!(
+                    "legacy Stratum solution {} cannot carry a miner block authorization",
+                    hash
                 );
-
-                info!(
-                    "STRATUM BLOCK at height {} hash={}",
-                    effective_header.height, hash
-                );
-
-                let mut h = effective_header.clone();
-                h.nonce = nonce;
-                h.extra_nonce = extra_nonce;
-                let block_height = h.height;
-                let block_reward = h.reward;
-                let block_total_fee = h.total_fee;
-                let block_difficulty = h.difficulty;
-
-                let reward_recipient = h.miner_pubkey;
-                let view_pub = self.accounting.get_view_public(&reward_recipient)
-                    .unwrap_or([0u8; 32]);
-
-                let block = Block {
-                    header: h,
-                    transactions: job.transactions.clone(),
-                    uncle_headers: Vec::new(),
-                    pq_signature: view_pub.to_vec(),
-                };
-                let data = bincode::serialize(&block).unwrap_or_default();
-                let tp = Arc::clone(&self.tp_client);
-                let job_manager = Arc::clone(&self.job_manager);
-                let accounting = Arc::clone(&self.accounting);
-                let job_id = job.job_id;
-                let block_hash_hex = hash.to_string();
-                tokio::spawn(async move {
-                    match tp.submit_block(data).await {
-                        Ok(r) if r.accepted => {
-                            accounting.settle_block(
-                                wallet_address,
-                                wallet_address,
-                                block_height,
-                                block_hash_hex,
-                                block_reward,
-                                block_total_fee,
-                                block_difficulty,
-                            );
-                            info!("Stratum block accepted");
-                        }
-                        Ok(r) => {
-                            job_manager.finish_block_submission(job_id, false);
-                            warn!("Stratum block rejected: {}", r.error);
-                        }
-                        Err(e) => {
-                            job_manager.finish_block_submission(job_id, false);
-                            error!("Stratum block submit failed: {e}");
-                        }
-                    }
-                });
-
-                if let Some(s) = self.sessions.write().get_mut(&sid) {
-                    s.shares += 1;
-                }
-
-                JsonRpcResponse {
-                    id: req.id.clone(),
-                    result: serde_json::json!(true),
-                    error: serde_json::Value::Null,
-                }
+                fail(
+                    24,
+                    "legacy Stratum is share-only and cannot submit frozen-v2 blocks; use pool protocol v3",
+                )
             }
 
-            ShareVerdict::ValidShare => {
+            ShareVerdict::ValidShare { .. } => {
                 self.accounting.record_valid_share(
                     wallet_address,
                     wallet_address,

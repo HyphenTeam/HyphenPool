@@ -11,7 +11,9 @@ use tracing::{error, info, warn};
 
 use crate::accounting::PoolAccounting;
 use crate::pow::EpochArena;
-use crate::primitives::{Block, ChainConfig, Hash256, SecretKey};
+use crate::primitives::{
+    blake3_hash, Block, BlockAuthorization, ChainConfig, Hash256, SecretKey, FROZEN_BLOCK_VERSION,
+};
 use crate::tp::{BlockTemplate, TemplateProvider, TP_TEMPLATE};
 
 use crate::job::{ActiveJob, JobManager};
@@ -62,6 +64,9 @@ struct MinerSession {
     difficulty_floor: u64,
     /// When the difficulty floor was last set; resets after the grace window.
     floor_set_at: std::time::Instant,
+    receipt_sequence: u64,
+    receipt_head: [u8; 32],
+    seen_submission_nonces: VecDeque<u64>,
 }
 
 struct VarDiffState {
@@ -273,15 +278,64 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
             .unwrap_or(fallback)
     }
 
+    fn register_submission_nonce(&self, miner_pk: &[u8; 32], nonce: u64) -> bool {
+        let mut miners = self.miners.write();
+        let Some(session) = miners.get_mut(miner_pk) else {
+            return false;
+        };
+        if session.seen_submission_nonces.contains(&nonce) {
+            return false;
+        }
+        session.seen_submission_nonces.push_back(nonce);
+        if session.seen_submission_nonces.len() > 4_096 {
+            session.seen_submission_nonces.pop_front();
+        }
+        true
+    }
+
+    fn next_share_receipt(
+        &self,
+        miner_pk: &[u8; 32],
+        submission_payload: &[u8],
+        result_payload: &[u8],
+    ) -> (u64, Vec<u8>, Vec<u8>) {
+        let mut miners = self.miners.write();
+        let Some(session) = miners.get_mut(miner_pk) else {
+            return (0, Vec::new(), Vec::new());
+        };
+        let previous = session.receipt_head;
+        let sequence = session.receipt_sequence.saturating_add(1);
+        let submission_hash = blake3_hash(submission_payload);
+        let result_hash = blake3_hash(result_payload);
+        let pool_pubkey = self.pool_key.public_key();
+        let receipt = share_receipt_hash(
+            pool_pubkey.as_bytes(),
+            miner_pk,
+            sequence,
+            &previous,
+            submission_hash.as_bytes(),
+            result_hash.as_bytes(),
+        );
+        session.receipt_sequence = sequence;
+        session.receipt_head = receipt;
+        (sequence, previous.to_vec(), receipt.to_vec())
+    }
+
     fn build_job_template_for_miner(
         &self,
         job: &ActiveJob,
         clean_jobs: bool,
         wallet_address: [u8; 32],
+        miner_pubkey: [u8; 32],
         share_difficulty: u64,
     ) -> JobTemplate {
         let mut header = job.header.clone();
-        header.miner_pubkey = self.accounting.reward_recipient_for_wallet(wallet_address);
+        header.miner_pubkey = miner_pubkey;
+        let reward_spend_public = self.accounting.reward_recipient_for_wallet(wallet_address);
+        let reward_view_public = self
+            .accounting
+            .get_view_public(&reward_spend_public)
+            .unwrap_or([0u8; 32]);
         let header_data = bincode::serialize(&header).expect("header serialisation");
         let arena_params = bincode::serialize(&ArenaParamsData {
             arena_size: job.arena_size as u64,
@@ -299,6 +353,11 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
             prev_hash: header.prev_hash.as_bytes().to_vec(),
             arena_params,
             clean_jobs,
+            consensus_params_hash: self.cfg.consensus_params_hash().to_vec(),
+            genesis_hash: self.cfg.genesis_hash().to_vec(),
+            reward_view_public: reward_view_public.to_vec(),
+            reward_spend_public: reward_spend_public.to_vec(),
+            transactions: job.transactions.clone(),
         }
     }
 
@@ -423,6 +482,44 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
     }
 
     fn apply_template(&self, tpl: &BlockTemplate) {
+        if tpl.protocol_version != 2
+            || tpl.network_magic.as_slice() != self.cfg.network_magic
+            || tpl.consensus_params_hash.as_slice() != self.cfg.consensus_params_hash()
+            || tpl.genesis_hash.as_slice() != self.cfg.genesis_hash()
+        {
+            warn!(
+                "Rejected template for wrong chain/protocol: version={}, magic={}",
+                tpl.protocol_version,
+                hex::encode(&tpl.network_magic),
+            );
+            return;
+        }
+        if tpl.template_id.len() != 32
+            || tpl.epoch_seed.len() != 32
+            || tpl.prev_hash.len() != 32
+            || tpl.difficulty == 0
+            || tpl.arena_size != self.cfg.arena_size as u64
+            || tpl.page_size != self.cfg.page_size as u64
+        {
+            warn!("Rejected malformed or incompatible node template");
+            return;
+        }
+        let header: crate::primitives::BlockHeader = match bincode::deserialize(&tpl.header_data) {
+            Ok(header) => header,
+            Err(error) => {
+                warn!("Rejected template with invalid header: {error}");
+                return;
+            }
+        };
+        if header.version != FROZEN_BLOCK_VERSION
+            || header.height != tpl.height
+            || header.difficulty != tpl.difficulty
+            || header.epoch_seed.as_bytes() != tpl.epoch_seed.as_slice()
+            || header.prev_hash.as_bytes() != tpl.prev_hash.as_slice()
+        {
+            warn!("Rejected template whose header metadata does not match its envelope");
+            return;
+        }
         match self.job_manager.ingest_template(tpl) {
             Ok(_job) => {
                 let _ = self.job_tx.send(PoolBroadcast::NewTemplate);
@@ -444,6 +541,33 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
         }
 
         let login = LoginRequest::decode(&login_env.payload[..])?;
+        if login.protocol_version != POOL_PROTOCOL_VERSION
+            || login.network_magic.as_slice() != self.cfg.network_magic
+            || login.consensus_params_hash.as_slice() != self.cfg.consensus_params_hash()
+            || login.genesis_hash.as_slice() != self.cfg.genesis_hash()
+        {
+            let ack = LoginAck {
+                accepted: false,
+                pool_id: self.pool_id.clone(),
+                error: format!(
+                    "network/protocol mismatch (expected {} / v{})",
+                    self.cfg.network_name, POOL_PROTOCOL_VERSION
+                ),
+                share_difficulty: 0,
+                chain_tip_hash: Vec::new(),
+                chain_height: 0,
+                block_difficulty: 0,
+                block_time_target_ms: self.cfg.block_time.as_millis() as u64,
+                network_name: self.cfg.network_name.clone(),
+                network_magic: self.cfg.network_magic.to_vec(),
+                protocol_version: POOL_PROTOCOL_VERSION,
+                consensus_params_hash: self.cfg.consensus_params_hash().to_vec(),
+                genesis_hash: self.cfg.genesis_hash().to_vec(),
+            };
+            let envelope = PoolEnvelope::sign(MSG_LOGIN_ACK, ack.encode_to_vec(), &self.pool_key);
+            PoolCodec::write_envelope(&mut stream, &envelope).await?;
+            return Ok(());
+        }
         let mut miner_pk = [0u8; 32];
         if login_env.sender_pubkey.len() != 32 {
             return Err(PoolError::InvalidPublicKey);
@@ -456,8 +580,15 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
             // New format: view_public (32) + spend_public (32)
             view_public.copy_from_slice(&login.payout_pubkey[..32]);
             wallet_addr.copy_from_slice(&login.payout_pubkey[32..64]);
-        } else if login.payout_pubkey.len() == 32 {
-            wallet_addr.copy_from_slice(&login.payout_pubkey);
+        } else {
+            return Err(PoolError::Internal(
+                "pool protocol v3 requires a 64-byte view/spend payout address".into(),
+            ));
+        }
+        if view_public == [0u8; 32] || wallet_addr == [0u8; 32] {
+            return Err(PoolError::Internal(
+                "payout address contains a zero public key".into(),
+            ));
         }
 
         info!(
@@ -491,6 +622,9 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                     estimated_target_diff: initial_diff,
                     difficulty_floor: gtm_initial,
                     floor_set_at: std::time::Instant::now(),
+                    receipt_sequence: 0,
+                    receipt_head: [0u8; 32],
+                    seen_submission_nonces: VecDeque::with_capacity(256),
                 },
             );
         }
@@ -517,12 +651,17 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
             block_difficulty: block_diff,
             block_time_target_ms: self.cfg.block_time.as_millis() as u64,
             network_name: self.cfg.network_name.clone(),
+            network_magic: self.cfg.network_magic.to_vec(),
+            protocol_version: POOL_PROTOCOL_VERSION,
+            consensus_params_hash: self.cfg.consensus_params_hash().to_vec(),
+            genesis_hash: self.cfg.genesis_hash().to_vec(),
         };
         let ack_env = PoolEnvelope::sign(MSG_LOGIN_ACK, ack.encode_to_vec(), &self.pool_key);
         PoolCodec::write_envelope(&mut stream, &ack_env).await?;
 
         if let Some(job) = current_job {
-            let template = self.build_job_template_for_miner(&job, true, wallet_addr, gtm_initial);
+            let template =
+                self.build_job_template_for_miner(&job, true, wallet_addr, miner_pk, gtm_initial);
             let job_env = PoolEnvelope::sign(MSG_JOB, template.encode_to_vec(), &self.pool_key);
             PoolCodec::write_envelope(&mut stream, &job_env).await?;
         }
@@ -541,11 +680,29 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
 
                     match env.msg_type {
                         MSG_SUBMIT => {
+                            if !self.register_submission_nonce(&miner_pk, env.nonce) {
+                                return Err(PoolError::Internal(
+                                    "duplicate or unauthenticated share envelope".into(),
+                                ));
+                            }
                             let reply = self.handle_share(&env, &miner_pk).await;
-                            let reply_env = PoolEnvelope::sign(
+                            let reply_payload = reply.encode_to_vec();
+                            let (sequence, previous, receipt) = if reply.accepted {
+                                self.next_share_receipt(
+                                    &miner_pk,
+                                    &env.payload,
+                                    &reply_payload,
+                                )
+                            } else {
+                                (0, Vec::new(), Vec::new())
+                            };
+                            let reply_env = PoolEnvelope::sign_with_receipt(
                                 MSG_SUBMIT_RESULT,
-                                reply.encode_to_vec(),
+                                reply_payload,
                                 &self.pool_key,
+                                sequence,
+                                previous,
+                                receipt,
                             );
                             PoolCodec::write_envelope(&mut stream, &reply_env).await?;
 
@@ -607,6 +764,7 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                                             &job,
                                             true,
                                             wallet,
+                                            miner_pk,
                                             diff,
                                         );
                                         let job_env = PoolEnvelope::sign(
@@ -683,6 +841,7 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                                             &job,
                                             true,
                                             wallet,
+                                            miner_pk,
                                             diff,
                                         );
                                         let job_env = PoolEnvelope::sign(
@@ -711,6 +870,7 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                                     &job,
                                     true,
                                     wallet,
+                                    miner_pk,
                                     diff,
                                 );
                                 let env = PoolEnvelope::sign(MSG_JOB, template.encode_to_vec(), &self.pool_key);
@@ -823,7 +983,7 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
         let wallet_address = self.session_wallet(miner_pk);
         let reward_recipient = self.accounting.reward_recipient_for_wallet(wallet_address);
         let mut effective_header = job.header.clone();
-        effective_header.miner_pubkey = reward_recipient;
+        effective_header.miner_pubkey = *miner_pk;
 
         // Use the difficulty floor as the effective share difficulty during
         // VarDiff transitions. The floor tracks the minimum difficulty over a
@@ -859,6 +1019,54 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
 
         match verdict {
             ShareVerdict::BlockFound { hash } => {
+                if submission.pow_hash.as_slice() != hash.as_bytes() {
+                    return SubmitResult {
+                        accepted: false,
+                        error: "submitted PoW hash does not match recomputed block hash".into(),
+                        block_found: false,
+                        block_hash: Vec::new(),
+                    };
+                }
+                let authorization: BlockAuthorization =
+                    match bincode::deserialize(&submission.block_authorization) {
+                        Ok(authorization) => authorization,
+                        Err(error) => {
+                            return SubmitResult {
+                                accepted: false,
+                                error: format!("missing or malformed block authorization: {error}"),
+                                block_found: false,
+                                block_hash: Vec::new(),
+                            };
+                        }
+                    };
+                let expected_view = self
+                    .accounting
+                    .get_view_public(&reward_recipient)
+                    .unwrap_or([0u8; 32]);
+                if authorization.reward_view_public != expected_view
+                    || authorization.reward_spend_public != reward_recipient
+                {
+                    return SubmitResult {
+                        accepted: false,
+                        error: "miner authorization reward keys do not match the advertised job"
+                            .into(),
+                        block_found: false,
+                        block_hash: Vec::new(),
+                    };
+                }
+
+                let mut authorized_header = effective_header.clone();
+                authorized_header.nonce = submission.nonce;
+                authorized_header.extra_nonce = extra_nonce;
+                if let Err(error) = authorization.verify(&authorized_header, &self.cfg) {
+                    return SubmitResult {
+                        accepted: false,
+                        error,
+                        block_found: false,
+                        block_hash: Vec::new(),
+                    };
+                }
+
                 if !self.job_manager.try_begin_block_submission(job.job_id) {
                     return SubmitResult {
                         accepted: false,
@@ -900,15 +1108,11 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                 let block_total_fee = mined_header.total_fee;
                 let block_difficulty = mined_header.difficulty;
 
-                // Look up view_public for the reward recipient to enable coinbase creation
-                let view_pub = self.accounting.get_view_public(&reward_recipient)
-                    .unwrap_or([0u8; 32]);
-
                 let block = Block {
                     header: mined_header,
                     transactions: job.transactions.clone(),
                     uncle_headers: Vec::new(),
-                    pq_signature: view_pub.to_vec(),
+                    block_authorization: submission.block_authorization.clone(),
                 };
 
                 let block_hash = block.hash();
@@ -981,7 +1185,17 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                 }
             }
 
-            ShareVerdict::ValidShare => {
+            ShareVerdict::ValidShare { hash } => {
+                if submission.pow_hash.as_slice() != hash.as_bytes()
+                    || !submission.block_authorization.is_empty()
+                {
+                    return SubmitResult {
+                        accepted: false,
+                        error: "share hash mismatch or unexpected block authorization".into(),
+                        block_found: false,
+                        block_hash: Vec::new(),
+                    };
+                }
                 self.accounting.record_valid_share(
                     *miner_pk,
                     wallet_address,
