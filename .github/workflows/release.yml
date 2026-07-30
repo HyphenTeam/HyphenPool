@@ -1,0 +1,75 @@
+name: Release
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.workflow_run.head_sha }}-${{ github.event.workflow_run.run_attempt }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04, artifact: hyphen-pool-linux-x86_64, executable: hyphen-pool-server }
+          - { os: windows-2022, artifact: hyphen-pool-windows-x86_64, executable: hyphen-pool-server.exe }
+          - { os: macos-14, artifact: hyphen-pool-macos-aarch64, executable: hyphen-pool-server }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+      - run: rustup toolchain install 1.97.0 --profile minimal
+      - run: rustup default 1.97.0
+      - name: Build and package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:CARGO_PROFILE_RELEASE_DEBUG = '1'
+          cargo build --release --locked
+          $stage=Join-Path 'target/package' '${{ matrix.artifact }}'
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item (Join-Path target/release '${{ matrix.executable }}') $stage
+          Copy-Item README.md, README_CN.md, LICENSE $stage
+          Get-ChildItem target/release -Filter '*.pdb' -ErrorAction SilentlyContinue | Copy-Item -Destination $stage
+          @('project=HyphenPool','commit=${{ github.event.workflow_run.head_sha }}',"rustc=$(rustc --version)","cargo=$(cargo --version)",'profile=release','debug=line-tables') |
+            Set-Content (Join-Path $stage 'BUILD-INFO.txt') -Encoding utf8
+          New-Item -ItemType Directory -Force dist | Out-Null
+          if ($IsWindows) { $archive="dist/${{ matrix.artifact }}.zip"; Compress-Archive -Path "$stage/*" -DestinationPath $archive }
+          else { $archive="dist/${{ matrix.artifact }}.tar.gz"; tar -czf $archive -C target/package '${{ matrix.artifact }}' }
+          $name=Split-Path $archive -Leaf; $hash=(Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $name" | Set-Content "$archive.sha256" -Encoding ascii
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with: { name: "${{ matrix.artifact }}", path: "dist/*", if-no-files-found: error, retention-days: 14 }
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions: { contents: write }
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with: { path: dist, merge-multiple: true }
+      - name: Publish prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+          RUN: ${{ github.event.workflow_run.run_number }}
+          ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+        shell: pwsh
+        run: |
+          $tag="build-$env:RUN.$env:ATTEMPT-$($env:SHA.Substring(0,12))"
+          $assets=(Get-ChildItem dist -File).FullName
+          gh release create $tag @assets --target $env:SHA --title "Hyphen Pool $tag" --prerelease --generate-notes --notes "Automated commit-bound build. Verify the matching SHA-256 file."
