@@ -265,7 +265,7 @@ pub fn evaluate_pow_with_epoch(
         let page_index = scratchpad.next_page(page_count);
         let page = arena.page(page_index);
         let kernel_id = scratchpad.select_kernel(page[32], cfg.kernel_count);
-        let kernel_out = execute_kernel(kernel_id, page, &scratchpad.state, &epoch);
+        let kernel_out = execute_kernel(kernel_id, page, &scratchpad.state, epoch);
         scratchpad.mix_state(&kernel_out);
 
         let write_pos =

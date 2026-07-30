@@ -9,6 +9,7 @@ use hyphen_pool::accounting::{PoolAccounting, PoolAccountingConfig, PoolMode};
 use hyphen_pool::api::start_pool_api;
 use hyphen_pool::chain::StandaloneProvider;
 use hyphen_pool::job::JobManager;
+use hyphen_pool::payout::{load_token_file, PayoutAgentClient, PayoutWorker, PayoutWorkerConfig};
 use hyphen_pool::primitives::{ChainConfig, SecretKey};
 use hyphen_pool::server::PoolServer;
 use hyphen_pool::stratum::StratumServer;
@@ -47,10 +48,6 @@ struct Cli {
     /// Network selection (mainnet | testnet | devnet)
     #[arg(long, value_parser = ["mainnet", "testnet", "devnet"], default_value = "devnet")]
     network: String,
-
-    /// Confirms that non-SOLO mainnet balances require an external payout process.
-    #[arg(long)]
-    acknowledge_manual_payouts: bool,
 
     /// Pool identifier
     #[arg(long, default_value = "hyphen-pool/0.1")]
@@ -97,6 +94,30 @@ struct Cli {
     /// In SOLO mode the miner's authorized address receives the coinbase.
     #[arg(long, default_value = "")]
     pool_wallet: String,
+
+    /// Loopback endpoint of hyphen-payout-agent. Required for shared modes.
+    #[arg(long, default_value = "")]
+    payout_agent: String,
+
+    /// Authentication token file shared with hyphen-payout-agent.
+    #[arg(long, default_value = "")]
+    payout_token_file: String,
+
+    /// Smallest wallet balance eligible for an automatic payout.
+    #[arg(long, default_value_t = 1_000_000u64)]
+    minimum_payout_atomic: u64,
+
+    /// Maximum amount placed in one automatic payout transaction.
+    #[arg(long, default_value_t = u64::MAX)]
+    maximum_payout_atomic: u64,
+
+    /// Canonical confirmations required before reserved credit becomes paid.
+    #[arg(long, default_value_t = 20u64)]
+    payout_confirmations: u64,
+
+    /// Automatic payout reconciliation interval in seconds.
+    #[arg(long, default_value_t = 30u64)]
+    payout_interval_secs: u64,
 }
 
 #[derive(Subcommand, Debug)]
@@ -152,15 +173,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if cli.key_file.is_empty() || cli.pool_wallet.is_empty() {
             return Err("mainnet pools require both --key-file and --pool-wallet".into());
         }
-        if cli.payout_mode != PoolMode::Solo && !cli.acknowledge_manual_payouts {
-            return Err(
-                "shared mainnet payout modes require --acknowledge-manual-payouts because automatic on-chain settlement is not implemented"
-                    .into(),
-            );
-        }
         if cli.enable_legacy_stratum {
             return Err("legacy Stratum is disabled on mainnet because it cannot carry miner block authorization".into());
         }
+    }
+    if cli.payout_mode != PoolMode::Solo
+        && (cli.payout_agent.is_empty() || cli.payout_token_file.is_empty())
+    {
+        return Err("shared payout modes require --payout-agent and --payout-token-file".into());
+    }
+    if cli.minimum_payout_atomic == 0
+        || cli.maximum_payout_atomic < cli.minimum_payout_atomic
+        || cli.payout_confirmations == 0
+        || cli.payout_interval_secs == 0
+    {
+        return Err("automatic payout bounds, confirmations and interval are invalid".into());
     }
 
     let sk = if cli.key_file.is_empty() {
@@ -249,6 +276,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_standalone(
     cli: Cli,
     cfg: ChainConfig,
@@ -288,6 +316,7 @@ async fn run_standalone(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_with_node(
     cli: Cli,
     cfg: ChainConfig,
@@ -322,6 +351,7 @@ async fn run_with_node(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn start_pool_and_stratum<T: TemplateProvider + Send + Sync + 'static>(
     cli: Cli,
     cfg: ChainConfig,
@@ -333,6 +363,30 @@ async fn start_pool_and_stratum<T: TemplateProvider + Send + Sync + 'static>(
     accounting: Arc<PoolAccounting>,
     tp: Arc<T>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let payout_handle = if cli.payout_mode != PoolMode::Solo {
+        let endpoint: SocketAddr = cli
+            .payout_agent
+            .parse()
+            .map_err(|error| format!("invalid payout-agent endpoint: {error}"))?;
+        let token = load_token_file(PathBuf::from(&cli.payout_token_file).as_path())?;
+        let expected_wallet = accounting.pool_wallet_address()?;
+        let client = PayoutAgentClient::new(endpoint, token, expected_wallet)?;
+        let worker = PayoutWorker::new(
+            Arc::clone(&accounting),
+            client,
+            PayoutWorkerConfig {
+                minimum_payout_atomic: cli.minimum_payout_atomic,
+                maximum_payout_atomic: cli.maximum_payout_atomic,
+                required_confirmations: cli.payout_confirmations,
+                interval: std::time::Duration::from_secs(cli.payout_interval_secs),
+            },
+        )?;
+        worker.verify_agent().await?;
+        Some(tokio::spawn(worker.run()))
+    } else {
+        None
+    };
+
     let pool = Arc::new(PoolServer::new(
         Arc::clone(&job_manager),
         Arc::clone(&tp),
@@ -382,6 +436,10 @@ async fn start_pool_and_stratum<T: TemplateProvider + Send + Sync + 'static>(
     }
     if let Some(h) = api_handle {
         let _ = h.await?;
+    }
+    if let Some(h) = payout_handle {
+        h.abort();
+        let _ = h.await;
     }
 
     Ok(())

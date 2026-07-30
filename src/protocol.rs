@@ -129,6 +129,7 @@ impl PoolEnvelope {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn sign_payload(
         msg_type: u32,
         payload: &[u8],

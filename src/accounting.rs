@@ -1,11 +1,16 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
 use clap::ValueEnum;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 use tracing::warn;
+
+const ACCOUNTING_STATE_MAGIC: &[u8; 16] = b"HyPoolAccountV1\0";
+type RecipientKey = ([u8; 32], [u8; 32]);
+type RecipientBalances = Vec<(String, u128)>;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -70,15 +75,80 @@ struct ShareCredit {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct MinerLedger {
     pub wallet_address: [u8; 32],
+    #[serde(default)]
+    pub wallet_view_public: [u8; 32],
     pub valid_shares: u64,
     pub invalid_shares: u64,
     pub accumulated_share_difficulty: u128,
     pub pending_payout_atomic: u128,
+    #[serde(default)]
+    pub reserved_payout_atomic: u128,
     pub direct_reward_atomic: u128,
     pub total_blocks_found: u64,
     pub total_paid_atomic: u128,
     pub last_share_timestamp: Option<u64>,
     pub last_disconnect_timestamp: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PayoutStatus {
+    Reserved,
+    Submitted {
+        tx_hash: String,
+        submitted_at: u64,
+    },
+    Confirmed {
+        tx_hash: String,
+        block_height: u64,
+        confirmations: u64,
+        confirmed_at: u64,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct PayoutAllocation {
+    miner_key: String,
+    amount_atomic: u128,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PayoutRecord {
+    pub intent_id: String,
+    pub recipient_view_public: [u8; 32],
+    pub recipient_spend_public: [u8; 32],
+    pub amount_atomic: u64,
+    pub created_at: u64,
+    pub status: PayoutStatus,
+    allocations: Vec<PayoutAllocation>,
+}
+
+impl PayoutRecord {
+    pub fn recipient_address(&self, network_magic: [u8; 4]) -> Result<String, AccountingError> {
+        encode_wallet_address(
+            self.recipient_view_public,
+            self.recipient_spend_public,
+            network_magic,
+        )
+    }
+}
+
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum AccountingError {
+    #[error("pool accounting is not configured with durable state")]
+    PersistenceDisabled,
+    #[error("pool accounting persistence failed: {0}")]
+    Persistence(String),
+    #[error("payout record was not found: {0}")]
+    PayoutNotFound(String),
+    #[error("invalid payout transition: {0}")]
+    InvalidPayoutTransition(String),
+    #[error("payout address is unavailable or inconsistent")]
+    MissingPayoutAddress,
+    #[error("payout amount cannot be represented on chain")]
+    PayoutAmountOverflow,
+    #[error("invalid network magic")]
+    InvalidNetwork,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -134,6 +204,7 @@ pub struct WalletLedgerSummary {
     pub invalid_shares: u64,
     pub accumulated_share_difficulty: u128,
     pub pending_payout_atomic: u128,
+    pub reserved_payout_atomic: u128,
     pub direct_reward_atomic: u128,
     pub total_blocks_found: u64,
     pub total_paid_atomic: u128,
@@ -141,6 +212,7 @@ pub struct WalletLedgerSummary {
     pub last_disconnect_timestamp: Option<u64>,
     pub recent_blocks: Vec<BlockSettlement>,
     pub recent_reward_events: Vec<WalletRewardEvent>,
+    pub recent_payouts: Vec<PayoutRecord>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -156,6 +228,80 @@ struct AccountingState {
     #[serde(default)]
     reward_events: Vec<WalletRewardEvent>,
     recent_blocks: Vec<BlockSettlement>,
+    #[serde(default)]
+    payouts: Vec<PayoutRecord>,
+    #[serde(default)]
+    next_payout_sequence: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct LegacyMinerLedgerV0 {
+    wallet_address: [u8; 32],
+    valid_shares: u64,
+    invalid_shares: u64,
+    accumulated_share_difficulty: u128,
+    pending_payout_atomic: u128,
+    direct_reward_atomic: u128,
+    total_blocks_found: u64,
+    total_paid_atomic: u128,
+    last_share_timestamp: Option<u64>,
+    last_disconnect_timestamp: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct LegacyAccountingStateV0 {
+    mode: PoolMode,
+    pool_fee_bps: u16,
+    pool_wallet: [u8; 32],
+    pplns_window_factor: u32,
+    pool_fee_earned_atomic: u128,
+    miners: HashMap<String, LegacyMinerLedgerV0>,
+    round_shares: Vec<ShareCredit>,
+    share_window: Vec<ShareCredit>,
+    #[serde(default)]
+    reward_events: Vec<WalletRewardEvent>,
+    recent_blocks: Vec<BlockSettlement>,
+}
+
+impl From<LegacyAccountingStateV0> for AccountingState {
+    fn from(legacy: LegacyAccountingStateV0) -> Self {
+        Self {
+            mode: legacy.mode,
+            pool_fee_bps: legacy.pool_fee_bps,
+            pool_wallet: legacy.pool_wallet,
+            pplns_window_factor: legacy.pplns_window_factor,
+            pool_fee_earned_atomic: legacy.pool_fee_earned_atomic,
+            miners: legacy
+                .miners
+                .into_iter()
+                .map(|(key, ledger)| {
+                    (
+                        key,
+                        MinerLedger {
+                            wallet_address: ledger.wallet_address,
+                            wallet_view_public: [0u8; 32],
+                            valid_shares: ledger.valid_shares,
+                            invalid_shares: ledger.invalid_shares,
+                            accumulated_share_difficulty: ledger.accumulated_share_difficulty,
+                            pending_payout_atomic: ledger.pending_payout_atomic,
+                            reserved_payout_atomic: 0,
+                            direct_reward_atomic: ledger.direct_reward_atomic,
+                            total_blocks_found: ledger.total_blocks_found,
+                            total_paid_atomic: ledger.total_paid_atomic,
+                            last_share_timestamp: ledger.last_share_timestamp,
+                            last_disconnect_timestamp: ledger.last_disconnect_timestamp,
+                        },
+                    )
+                })
+                .collect(),
+            round_shares: legacy.round_shares,
+            share_window: legacy.share_window,
+            reward_events: legacy.reward_events,
+            recent_blocks: legacy.recent_blocks,
+            payouts: Vec::new(),
+            next_payout_sequence: 0,
+        }
+    }
 }
 
 impl AccountingState {
@@ -171,6 +317,8 @@ impl AccountingState {
             share_window: Vec::new(),
             reward_events: Vec::new(),
             recent_blocks: Vec::new(),
+            payouts: Vec::new(),
+            next_payout_sequence: 0,
         }
     }
 }
@@ -197,6 +345,11 @@ impl PoolAccounting {
         if config.pool_view_public != [0u8; 32] {
             view_keys.insert(config.pool_wallet, config.pool_view_public);
         }
+        for ledger in state.miners.values() {
+            if ledger.wallet_address != [0u8; 32] && ledger.wallet_view_public != [0u8; 32] {
+                view_keys.insert(ledger.wallet_address, ledger.wallet_view_public);
+            }
+        }
         Self {
             state: RwLock::new(state),
             state_path,
@@ -214,8 +367,7 @@ impl PoolAccounting {
         input: &str,
         network_magic: [u8; 4],
     ) -> Result<([u8; 32], [u8; 32]), String> {
-        if input.starts_with("hy1") {
-            let encoded = &input[3..];
+        if let Some(encoded) = input.strip_prefix("hy1") {
             let payload = bs58::decode(encoded)
                 .into_vec()
                 .map_err(|error| format!("invalid hy1 address base58: {error}"))?;
@@ -255,6 +407,17 @@ impl PoolAccounting {
         self.state.read().pool_wallet
     }
 
+    pub fn pool_wallet_address(&self) -> Result<String, AccountingError> {
+        let state = self.state.read();
+        let view_public = self
+            .view_keys
+            .read()
+            .get(&state.pool_wallet)
+            .copied()
+            .ok_or(AccountingError::MissingPayoutAddress)?;
+        encode_wallet_address(view_public, state.pool_wallet, self.network_magic)
+    }
+
     pub fn pool_fee_bps(&self) -> u16 {
         self.state.read().pool_fee_bps
     }
@@ -280,10 +443,17 @@ impl PoolAccounting {
 
     pub fn register_miner(&self, miner_pubkey: [u8; 32], wallet_address: [u8; 32]) {
         let now = now_secs();
+        let wallet_view_public = self
+            .view_keys
+            .read()
+            .get(&wallet_address)
+            .copied()
+            .unwrap_or([0u8; 32]);
         {
             let mut state = self.state.write();
             let ledger = state.miners.entry(hex::encode(miner_pubkey)).or_default();
             ledger.wallet_address = wallet_address;
+            ledger.wallet_view_public = wallet_view_public;
             ledger.last_share_timestamp.get_or_insert(now);
         }
         self.save_if_needed(true);
@@ -312,6 +482,9 @@ impl PoolAccounting {
             let valid_share_count = {
                 let ledger = state.miners.entry(miner_key.clone()).or_default();
                 ledger.wallet_address = wallet_address;
+                if let Some(view_public) = self.view_keys.read().get(&wallet_address) {
+                    ledger.wallet_view_public = *view_public;
+                }
                 ledger.valid_shares = ledger.valid_shares.saturating_add(1);
                 ledger.accumulated_share_difficulty = ledger
                     .accumulated_share_difficulty
@@ -424,6 +597,7 @@ impl PoolAccounting {
             invalid_shares: 0,
             accumulated_share_difficulty: 0,
             pending_payout_atomic: 0,
+            reserved_payout_atomic: 0,
             direct_reward_atomic: 0,
             total_blocks_found: 0,
             total_paid_atomic: 0,
@@ -431,6 +605,7 @@ impl PoolAccounting {
             last_disconnect_timestamp: None,
             recent_blocks: Vec::new(),
             recent_reward_events: Vec::new(),
+            recent_payouts: Vec::new(),
         };
 
         for ledger in state.miners.values() {
@@ -447,6 +622,9 @@ impl PoolAccounting {
             summary.pending_payout_atomic = summary
                 .pending_payout_atomic
                 .saturating_add(ledger.pending_payout_atomic);
+            summary.reserved_payout_atomic = summary
+                .reserved_payout_atomic
+                .saturating_add(ledger.reserved_payout_atomic);
             summary.direct_reward_atomic = summary
                 .direct_reward_atomic
                 .saturating_add(ledger.direct_reward_atomic);
@@ -482,9 +660,299 @@ impl PoolAccounting {
             .cloned()
             .collect();
 
+        summary.recent_payouts = state
+            .payouts
+            .iter()
+            .rev()
+            .filter(|payout| payout.recipient_spend_public == wallet_address)
+            .take(recent_limit.max(1))
+            .cloned()
+            .collect();
+
         summary
     }
 
+    pub fn network_magic(&self) -> [u8; 4] {
+        self.network_magic
+    }
+
+    /// Returns the oldest payout that has not reached the configured
+    /// confirmation threshold in the worker.
+    pub fn active_payout(&self) -> Option<PayoutRecord> {
+        self.state
+            .read()
+            .payouts
+            .iter()
+            .find(|record| !matches!(record.status, PayoutStatus::Confirmed { .. }))
+            .cloned()
+    }
+
+    pub fn recent_payouts(&self, limit: usize) -> Vec<PayoutRecord> {
+        self.state
+            .read()
+            .payouts
+            .iter()
+            .rev()
+            .take(limit.max(1))
+            .cloned()
+            .collect()
+    }
+
+    /// Atomically reserves one wallet's payable balance. A reservation
+    /// subtracts from `pending_payout_atomic` and moves the same amount into
+    /// `reserved_payout_atomic`; no value is counted as paid yet.
+    pub fn reserve_next_payout(
+        &self,
+        minimum_payout_atomic: u64,
+        maximum_payout_atomic: u64,
+    ) -> Result<Option<PayoutRecord>, AccountingError> {
+        if minimum_payout_atomic == 0 || maximum_payout_atomic < minimum_payout_atomic {
+            return Err(AccountingError::InvalidPayoutTransition(
+                "invalid minimum/maximum payout bounds".into(),
+            ));
+        }
+        if self.state_path.is_none() {
+            return Err(AccountingError::PersistenceDisabled);
+        }
+
+        let mut state = self.state.write();
+        if state
+            .payouts
+            .iter()
+            .any(|record| !matches!(record.status, PayoutStatus::Confirmed { .. }))
+        {
+            return Ok(None);
+        }
+
+        let mut recipients: BTreeMap<RecipientKey, RecipientBalances> = BTreeMap::new();
+        let mut missing_address_balance = 0u128;
+        for (miner_key, ledger) in &state.miners {
+            if ledger.pending_payout_atomic == 0 {
+                continue;
+            }
+            if ledger.wallet_address == [0u8; 32] || ledger.wallet_view_public == [0u8; 32] {
+                missing_address_balance =
+                    missing_address_balance.saturating_add(ledger.pending_payout_atomic);
+                continue;
+            }
+            recipients
+                .entry((ledger.wallet_view_public, ledger.wallet_address))
+                .or_default()
+                .push((miner_key.clone(), ledger.pending_payout_atomic));
+        }
+
+        let minimum = minimum_payout_atomic as u128;
+        let selected = recipients.into_iter().find(|(_, allocations)| {
+            allocations
+                .iter()
+                .try_fold(0u128, |total, (_, amount)| total.checked_add(*amount))
+                .is_some_and(|total| total >= minimum)
+        });
+        let Some(((view_public, spend_public), mut balances)) = selected else {
+            if missing_address_balance >= minimum {
+                return Err(AccountingError::MissingPayoutAddress);
+            }
+            return Ok(None);
+        };
+        balances.sort_by(|left, right| left.0.cmp(&right.0));
+
+        let target = balances
+            .iter()
+            .try_fold(0u128, |total, (_, amount)| total.checked_add(*amount))
+            .ok_or(AccountingError::PayoutAmountOverflow)?
+            .min(maximum_payout_atomic as u128);
+        let amount_atomic =
+            u64::try_from(target).map_err(|_| AccountingError::PayoutAmountOverflow)?;
+        let mut remaining = target;
+        let mut allocations = Vec::new();
+        for (miner_key, balance) in balances {
+            if remaining == 0 {
+                break;
+            }
+            let amount = balance.min(remaining);
+            allocations.push(PayoutAllocation {
+                miner_key,
+                amount_atomic: amount,
+            });
+            remaining -= amount;
+        }
+        if remaining != 0 {
+            return Err(AccountingError::InvalidPayoutTransition(
+                "reservation allocations do not sum to the payout".into(),
+            ));
+        }
+
+        let sequence = state.next_payout_sequence;
+        let next_sequence = sequence.checked_add(1).ok_or_else(|| {
+            AccountingError::InvalidPayoutTransition("payout sequence exhausted".into())
+        })?;
+        let intent_hash = blake3::hash(
+            &[
+                b"Hyphen/Pool/PayoutIntent/v1".as_slice(),
+                self.network_magic.as_slice(),
+                state.pool_wallet.as_slice(),
+                sequence.to_le_bytes().as_slice(),
+                view_public.as_slice(),
+                spend_public.as_slice(),
+                amount_atomic.to_le_bytes().as_slice(),
+            ]
+            .concat(),
+        );
+        let record = PayoutRecord {
+            intent_id: hex::encode(intent_hash.as_bytes()),
+            recipient_view_public: view_public,
+            recipient_spend_public: spend_public,
+            amount_atomic,
+            created_at: now_secs(),
+            status: PayoutStatus::Reserved,
+            allocations,
+        };
+
+        let previous = state.clone();
+        for allocation in &record.allocations {
+            let ledger = state.miners.get(&allocation.miner_key).ok_or_else(|| {
+                AccountingError::InvalidPayoutTransition("reservation miner disappeared".into())
+            })?;
+            if ledger.pending_payout_atomic < allocation.amount_atomic {
+                return Err(AccountingError::InvalidPayoutTransition(
+                    "reservation exceeds pending balance".into(),
+                ));
+            }
+            ledger
+                .reserved_payout_atomic
+                .checked_add(allocation.amount_atomic)
+                .ok_or(AccountingError::PayoutAmountOverflow)?;
+        }
+        for allocation in &record.allocations {
+            let ledger = state
+                .miners
+                .get_mut(&allocation.miner_key)
+                .expect("reservation was validated against the same locked state");
+            ledger.pending_payout_atomic -= allocation.amount_atomic;
+            ledger.reserved_payout_atomic += allocation.amount_atomic;
+        }
+        state.next_payout_sequence = next_sequence;
+        state.payouts.push(record.clone());
+        if let Err(error) = self.persist_state(&state) {
+            *state = previous;
+            return Err(error);
+        }
+        Ok(Some(record))
+    }
+
+    pub fn mark_payout_submitted(
+        &self,
+        intent_id: &str,
+        tx_hash: &str,
+    ) -> Result<PayoutRecord, AccountingError> {
+        validate_hash_hex(tx_hash, "transaction hash")?;
+        let mut state = self.state.write();
+        let previous = state.clone();
+        let record = state
+            .payouts
+            .iter_mut()
+            .find(|record| record.intent_id == intent_id)
+            .ok_or_else(|| AccountingError::PayoutNotFound(intent_id.to_owned()))?;
+        match &record.status {
+            PayoutStatus::Reserved => {
+                record.status = PayoutStatus::Submitted {
+                    tx_hash: tx_hash.to_owned(),
+                    submitted_at: now_secs(),
+                };
+            }
+            PayoutStatus::Submitted {
+                tx_hash: existing, ..
+            } if existing == tx_hash => {}
+            PayoutStatus::Confirmed {
+                tx_hash: existing, ..
+            } if existing == tx_hash => return Ok(record.clone()),
+            _ => {
+                return Err(AccountingError::InvalidPayoutTransition(
+                    "intent is already bound to another transaction".into(),
+                ));
+            }
+        }
+        let updated = record.clone();
+        if let Err(error) = self.persist_state(&state) {
+            *state = previous;
+            return Err(error);
+        }
+        Ok(updated)
+    }
+
+    pub fn mark_payout_confirmed(
+        &self,
+        intent_id: &str,
+        tx_hash: &str,
+        block_height: u64,
+        confirmations: u64,
+    ) -> Result<PayoutRecord, AccountingError> {
+        if confirmations == 0 {
+            return Err(AccountingError::InvalidPayoutTransition(
+                "a confirmed payout must have at least one confirmation".into(),
+            ));
+        }
+        validate_hash_hex(tx_hash, "transaction hash")?;
+        let mut state = self.state.write();
+        let previous = state.clone();
+        let index = state
+            .payouts
+            .iter()
+            .position(|record| record.intent_id == intent_id)
+            .ok_or_else(|| AccountingError::PayoutNotFound(intent_id.to_owned()))?;
+        match &state.payouts[index].status {
+            PayoutStatus::Confirmed {
+                tx_hash: existing, ..
+            } if existing == tx_hash => return Ok(state.payouts[index].clone()),
+            PayoutStatus::Submitted {
+                tx_hash: existing, ..
+            } if existing == tx_hash => {}
+            _ => {
+                return Err(AccountingError::InvalidPayoutTransition(
+                    "payout must be submitted under the same transaction before confirmation"
+                        .into(),
+                ));
+            }
+        }
+
+        let allocations = state.payouts[index].allocations.clone();
+        for allocation in &allocations {
+            let ledger = state.miners.get(&allocation.miner_key).ok_or_else(|| {
+                AccountingError::InvalidPayoutTransition("confirmed miner disappeared".into())
+            })?;
+            if ledger.reserved_payout_atomic < allocation.amount_atomic {
+                return Err(AccountingError::InvalidPayoutTransition(
+                    "confirmed amount exceeds reserved balance".into(),
+                ));
+            }
+            ledger
+                .total_paid_atomic
+                .checked_add(allocation.amount_atomic)
+                .ok_or(AccountingError::PayoutAmountOverflow)?;
+        }
+        for allocation in allocations {
+            let ledger = state
+                .miners
+                .get_mut(&allocation.miner_key)
+                .expect("confirmation was validated against the same locked state");
+            ledger.reserved_payout_atomic -= allocation.amount_atomic;
+            ledger.total_paid_atomic += allocation.amount_atomic;
+        }
+        state.payouts[index].status = PayoutStatus::Confirmed {
+            tx_hash: tx_hash.to_owned(),
+            block_height,
+            confirmations,
+            confirmed_at: now_secs(),
+        };
+        let updated = state.payouts[index].clone();
+        if let Err(error) = self.persist_state(&state) {
+            *state = previous;
+            return Err(error);
+        }
+        Ok(updated)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn settle_block(
         &self,
         finder_pubkey: [u8; 32],
@@ -646,6 +1114,7 @@ impl PoolAccounting {
         self.save_if_needed(true);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn distribute_weighted(
         miners: &mut HashMap<String, MinerLedger>,
         shares: &[ShareCredit],
@@ -762,11 +1231,18 @@ impl PoolAccounting {
 
     fn load_state(path: &Path) -> Option<AccountingState> {
         let raw = std::fs::read(path).ok()?;
-        if let Ok(state) = bincode::deserialize::<AccountingState>(&raw) {
-            return Some(state);
+        if let Some(encoded) = raw.strip_prefix(ACCOUNTING_STATE_MAGIC) {
+            return bincode::deserialize::<AccountingState>(encoded).ok();
+        }
+        if let Ok(state) = bincode::deserialize::<LegacyAccountingStateV0>(&raw) {
+            return Some(state.into());
         }
         let text = std::str::from_utf8(&raw).ok()?;
-        serde_json::from_str(text).ok()
+        serde_json::from_str(text).ok().or_else(|| {
+            serde_json::from_str::<LegacyAccountingStateV0>(text)
+                .ok()
+                .map(Into::into)
+        })
     }
 
     fn load_state_with_backup(path: &Path) -> Option<AccountingState> {
@@ -789,53 +1265,55 @@ impl PoolAccounting {
             return;
         }
 
-        let Some(path) = &self.state_path else {
-            return;
-        };
-
-        if let Some(parent) = path.parent() {
-            if let Err(error) = std::fs::create_dir_all(parent) {
-                warn!("Failed to create pool accounting dir: {error}");
-                return;
-            }
-        }
-
         let state = self.state.read().clone();
-        match bincode::serialize(&state) {
-            Ok(bytes) => {
-                let temporary = persistence_sidecar(path, "next");
-                let backup = persistence_sidecar(path, "bak");
-                let write_result = (|| -> Result<(), std::io::Error> {
-                    use std::io::Write;
-
-                    let mut file = std::fs::OpenOptions::new()
-                        .create(true)
-                        .truncate(true)
-                        .write(true)
-                        .open(&temporary)?;
-                    file.write_all(&bytes)?;
-                    file.sync_all()?;
-
-                    if path.exists() {
-                        if backup.exists() {
-                            std::fs::remove_file(&backup)?;
-                        }
-                        std::fs::rename(path, &backup)?;
-                    }
-                    if let Err(error) = std::fs::rename(&temporary, path) {
-                        if !path.exists() && backup.exists() {
-                            let _ = std::fs::rename(&backup, path);
-                        }
-                        return Err(error);
-                    }
-                    Ok(())
-                })();
-                if let Err(error) = write_result {
-                    warn!("Failed to atomically persist pool accounting state: {error}");
-                }
-            }
-            Err(error) => warn!("Failed to serialize pool accounting state: {error}"),
+        if let Err(error) = self.persist_state(&state) {
+            warn!("Failed to atomically persist pool accounting state: {error}");
         }
+    }
+
+    fn persist_state(&self, state: &AccountingState) -> Result<(), AccountingError> {
+        let path = self
+            .state_path
+            .as_ref()
+            .ok_or(AccountingError::PersistenceDisabled)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| AccountingError::Persistence(error.to_string()))?;
+        }
+        let encoded = bincode::serialize(state)
+            .map_err(|error| AccountingError::Persistence(error.to_string()))?;
+        let mut bytes = Vec::with_capacity(ACCOUNTING_STATE_MAGIC.len() + encoded.len());
+        bytes.extend_from_slice(ACCOUNTING_STATE_MAGIC);
+        bytes.extend_from_slice(&encoded);
+        let temporary = persistence_sidecar(path, "next");
+        let backup = persistence_sidecar(path, "bak");
+        let write_result = (|| -> Result<(), std::io::Error> {
+            use std::io::Write;
+
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&temporary)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            drop(file);
+
+            if path.exists() {
+                if backup.exists() {
+                    std::fs::remove_file(&backup)?;
+                }
+                std::fs::rename(path, &backup)?;
+            }
+            if let Err(error) = std::fs::rename(&temporary, path) {
+                if !path.exists() && backup.exists() {
+                    let _ = std::fs::rename(&backup, path);
+                }
+                return Err(error);
+            }
+            Ok(())
+        })();
+        write_result.map_err(|error| AccountingError::Persistence(error.to_string()))
     }
 }
 
@@ -845,6 +1323,40 @@ fn persistence_sidecar(path: &Path, suffix: &str) -> PathBuf {
         .and_then(|name| name.to_str())
         .unwrap_or("pool_accounting.bin");
     path.with_file_name(format!("{file_name}.{suffix}"))
+}
+
+fn validate_hash_hex(value: &str, name: &str) -> Result<(), AccountingError> {
+    let bytes = hex::decode(value).map_err(|_| {
+        AccountingError::InvalidPayoutTransition(format!("{name} must be hexadecimal"))
+    })?;
+    if bytes.len() != 32 {
+        return Err(AccountingError::InvalidPayoutTransition(format!(
+            "{name} must be exactly 32 bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn encode_wallet_address(
+    view_public: [u8; 32],
+    spend_public: [u8; 32],
+    network_magic: [u8; 4],
+) -> Result<String, AccountingError> {
+    if view_public == [0u8; 32] || spend_public == [0u8; 32] {
+        return Err(AccountingError::MissingPayoutAddress);
+    }
+    let version = match network_magic {
+        [0x48, 0x59, 0x50, 0x4e] => 0x01,
+        [0x48, 0x59, 0x54, 0x53] | [0x48, 0x59, 0x44, 0x56] => 0x02,
+        _ => return Err(AccountingError::InvalidNetwork),
+    };
+    let mut payload = Vec::with_capacity(69);
+    payload.push(version);
+    payload.extend_from_slice(&view_public);
+    payload.extend_from_slice(&spend_public);
+    let checksum = blake3::hash(&payload);
+    payload.extend_from_slice(&checksum.as_bytes()[..4]);
+    Ok(format!("hy1{}", bs58::encode(payload).into_string()))
 }
 
 fn proportional_credit(share_difficulty: u64, block_difficulty: u64, amount: u128) -> u128 {
@@ -1027,5 +1539,130 @@ mod tests {
                 .pending_payout_atomic,
             400
         );
+    }
+
+    #[test]
+    fn payout_reservation_submission_and_confirmation_are_durable_and_idempotent() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "hyphen_pool_payout_test_{}_{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let mut config = sample_config();
+        config.mode = PoolMode::Pps;
+        config.pool_fee_bps = 100;
+        config.pool_view_public = [6u8; 32];
+        config.state_dir = Some(test_dir.clone());
+        let miner = [7u8; 32];
+        let view_public = [8u8; 32];
+        let wallet = [9u8; 32];
+        let tx_hash = "ab".repeat(32);
+
+        let intent_id = {
+            let accounting = PoolAccounting::new(config.clone());
+            accounting.register_view_key(wallet, view_public);
+            accounting.register_miner(miner, wallet);
+            accounting.record_valid_share(miner, wallet, 1, 1, 100, 0);
+
+            let reserved = accounting.reserve_next_payout(50, 90).unwrap().unwrap();
+            assert_eq!(reserved.amount_atomic, 90);
+            assert!(reserved
+                .recipient_address(accounting.network_magic())
+                .unwrap()
+                .starts_with("hy1"));
+            let ledger = accounting.miner_ledger(&miner).unwrap();
+            assert_eq!(ledger.pending_payout_atomic, 9);
+            assert_eq!(ledger.reserved_payout_atomic, 90);
+            assert!(accounting.reserve_next_payout(1, 90).unwrap().is_none());
+
+            accounting
+                .mark_payout_submitted(&reserved.intent_id, &tx_hash)
+                .unwrap();
+            accounting
+                .mark_payout_submitted(&reserved.intent_id, &tx_hash)
+                .unwrap();
+            accounting
+                .mark_payout_confirmed(&reserved.intent_id, &tx_hash, 12, 20)
+                .unwrap();
+            accounting
+                .mark_payout_confirmed(&reserved.intent_id, &tx_hash, 12, 20)
+                .unwrap();
+
+            let ledger = accounting.miner_ledger(&miner).unwrap();
+            assert_eq!(ledger.pending_payout_atomic, 9);
+            assert_eq!(ledger.reserved_payout_atomic, 0);
+            assert_eq!(ledger.total_paid_atomic, 90);
+            reserved.intent_id
+        };
+
+        let reopened = PoolAccounting::new(config);
+        let ledger = reopened.miner_ledger(&miner).unwrap();
+        assert_eq!(ledger.total_paid_atomic, 90);
+        assert!(matches!(
+            reopened
+                .recent_payouts(1)
+                .into_iter()
+                .find(|record| record.intent_id == intent_id)
+                .unwrap()
+                .status,
+            PayoutStatus::Confirmed {
+                confirmations: 20,
+                ..
+            }
+        ));
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn legacy_accounting_state_is_migrated_without_losing_pending_credit() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "hyphen_pool_legacy_test_{}_{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let miner = [21u8; 32];
+        let mut miners = HashMap::new();
+        miners.insert(
+            hex::encode(miner),
+            LegacyMinerLedgerV0 {
+                wallet_address: [22u8; 32],
+                valid_shares: 3,
+                invalid_shares: 1,
+                accumulated_share_difficulty: 7,
+                pending_payout_atomic: 55,
+                direct_reward_atomic: 0,
+                total_blocks_found: 0,
+                total_paid_atomic: 0,
+                last_share_timestamp: None,
+                last_disconnect_timestamp: None,
+            },
+        );
+        let legacy = LegacyAccountingStateV0 {
+            mode: PoolMode::Pps,
+            pool_fee_bps: 100,
+            pool_wallet: [9u8; 32],
+            pplns_window_factor: 2,
+            pool_fee_earned_atomic: 0,
+            miners,
+            round_shares: Vec::new(),
+            share_window: Vec::new(),
+            reward_events: Vec::new(),
+            recent_blocks: Vec::new(),
+        };
+        std::fs::write(
+            test_dir.join("pool_accounting.bin"),
+            bincode::serialize(&legacy).unwrap(),
+        )
+        .unwrap();
+        let mut config = sample_config();
+        config.state_dir = Some(test_dir.clone());
+        let accounting = PoolAccounting::new(config);
+        let ledger = accounting.miner_ledger(&miner).unwrap();
+        assert_eq!(ledger.pending_payout_atomic, 55);
+        assert_eq!(ledger.reserved_payout_atomic, 0);
+
+        let _ = std::fs::remove_dir_all(test_dir);
     }
 }

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use crate::accounting::PoolAccounting;
 use crate::job::{ActiveJob, JobManager};
@@ -50,7 +50,7 @@ struct StratumSession {
 
 pub struct StratumServer<T: TemplateProvider + Send + Sync + 'static> {
     job_manager: Arc<JobManager>,
-    tp_client: Arc<T>,
+    _tp_client: Arc<T>,
     accounting: Arc<PoolAccounting>,
     cfg: ChainConfig,
     bind_addr: SocketAddr,
@@ -72,7 +72,7 @@ impl<T: TemplateProvider + Send + Sync + 'static> StratumServer<T> {
         let (job_tx, _) = broadcast::channel(256);
         Self {
             job_manager,
-            tp_client,
+            _tp_client: tp_client,
             accounting,
             cfg,
             bind_addr,

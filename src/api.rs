@@ -11,8 +11,8 @@ use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
 
 use crate::accounting::{
-    BlockSettlement, PoolAccounting, PoolMode, RewardEventKind, WalletLedgerSummary,
-    WalletRewardEvent,
+    BlockSettlement, PayoutRecord, PayoutStatus, PoolAccounting, PoolMode, RewardEventKind,
+    WalletLedgerSummary, WalletRewardEvent,
 };
 
 const ATOMIC_UNITS: u128 = 1_000_000_000_000;
@@ -44,6 +44,8 @@ struct WalletBalanceResponse {
     accumulated_share_difficulty: String,
     pending_payout: String,
     pending_payout_atomic: String,
+    reserved_payout: String,
+    reserved_payout_atomic: String,
     direct_reward: String,
     direct_reward_atomic: String,
     total_paid: String,
@@ -55,6 +57,7 @@ struct WalletBalanceResponse {
     last_disconnect_timestamp: Option<u64>,
     recent_blocks: Vec<WalletBlockSettlement>,
     recent_reward_events: Vec<WalletRewardEventResponse>,
+    recent_payouts: Vec<WalletPayoutResponse>,
 }
 
 #[derive(Serialize)]
@@ -84,6 +87,15 @@ struct WalletRewardEventResponse {
     kind: RewardEventKind,
     direct_coinbase: bool,
     timestamp: u64,
+}
+
+#[derive(Serialize)]
+struct WalletPayoutResponse {
+    intent_id: String,
+    amount: String,
+    amount_atomic: u64,
+    created_at: u64,
+    status: PayoutStatus,
 }
 
 #[derive(Serialize)]
@@ -118,6 +130,7 @@ fn error_json(status: StatusCode, message: impl Into<String>) -> (StatusCode, Js
 fn map_summary(summary: WalletLedgerSummary) -> WalletBalanceResponse {
     let total_earned_atomic = summary
         .pending_payout_atomic
+        .saturating_add(summary.reserved_payout_atomic)
         .saturating_add(summary.direct_reward_atomic)
         .saturating_add(summary.total_paid_atomic);
 
@@ -134,6 +147,8 @@ fn map_summary(summary: WalletLedgerSummary) -> WalletBalanceResponse {
         accumulated_share_difficulty: summary.accumulated_share_difficulty.to_string(),
         pending_payout: format_hpn_128(summary.pending_payout_atomic),
         pending_payout_atomic: summary.pending_payout_atomic.to_string(),
+        reserved_payout: format_hpn_128(summary.reserved_payout_atomic),
+        reserved_payout_atomic: summary.reserved_payout_atomic.to_string(),
         direct_reward: format_hpn_128(summary.direct_reward_atomic),
         direct_reward_atomic: summary.direct_reward_atomic.to_string(),
         total_paid: format_hpn_128(summary.total_paid_atomic),
@@ -149,6 +164,17 @@ fn map_summary(summary: WalletLedgerSummary) -> WalletBalanceResponse {
             .into_iter()
             .map(map_reward_event)
             .collect(),
+        recent_payouts: summary.recent_payouts.into_iter().map(map_payout).collect(),
+    }
+}
+
+fn map_payout(payout: PayoutRecord) -> WalletPayoutResponse {
+    WalletPayoutResponse {
+        intent_id: payout.intent_id,
+        amount: format_hpn_128(payout.amount_atomic as u128),
+        amount_atomic: payout.amount_atomic,
+        created_at: payout.created_at,
+        status: payout.status,
     }
 }
 
