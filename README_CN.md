@@ -81,4 +81,4 @@ Share 回执链把池公钥、矿工公钥、序号、前一回执、submission 
 
 CI 执行格式检查、严格 Clippy、全部测试和锁定依赖的 release build。只有 `main` 的 CI 成功后才自动构建 Linux、Windows、macOS 包，附提交号、工具链、调试信息和 SHA-256，并创建 commit-bound prerelease。
 
-本仓库使用 AGPL-3.0。`pool.key`、payout token、钱包 seed 和状态备份都属于敏感数据。
+本仓库使用 PolyForm Strict License 1.0.0。`pool.key`、payout token、钱包 seed 和状态备份都属于敏感数据。

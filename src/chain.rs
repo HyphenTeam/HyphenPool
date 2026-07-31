@@ -91,7 +91,9 @@ impl ChainState {
         let json_path = dir.join("chain_state.json");
         let loaded = if bin_path.exists() {
             std::fs::read(&bin_path).ok().and_then(|raw| {
-                hyphen_codec::deserialize_with_limit::<PersistedState>(&raw, 64 * 1024 * 1024).ok()
+                crate::wire_config(64 * 1024 * 1024)
+                    .deserialize::<PersistedState>(&raw)
+                    .ok()
             })
         } else if json_path.exists() {
             std::fs::read_to_string(&json_path)
@@ -126,7 +128,7 @@ impl ChainState {
                 history: self.history.read().clone(),
                 balances: self.balances.read().clone(),
             };
-            match hyphen_codec::serialize_with_limit(&persisted, 64 * 1024 * 1024) {
+            match crate::wire_config(64 * 1024 * 1024).serialize(&persisted) {
                 Ok(bytes) => {
                     if let Err(e) = std::fs::write(dir.join("chain_state.bin"), bytes) {
                         warn!("Failed to write chain_state.bin: {e}");
@@ -213,7 +215,9 @@ impl ChainState {
             block_size: 0,
         };
 
-        let header_data = hyphen_codec::serialize(&header).expect("header serialisation");
+        let header_data = crate::wire_config(crate::DEFAULT_WIRE_BYTES)
+            .serialize(&header)
+            .expect("header serialisation");
         let template_id = blake3_hash_many(&[
             &next_height.to_le_bytes(),
             &next_difficulty.to_le_bytes(),
@@ -448,7 +452,8 @@ impl TemplateProvider for StandaloneProvider {
     }
 
     async fn submit_block(&self, block_data: Vec<u8>) -> Result<SubmitBlockResult, TPError> {
-        let block: Block = hyphen_codec::deserialize_with_limit(&block_data, 8 * 1024 * 1024)
+        let block: Block = crate::wire_config(8 * 1024 * 1024)
+            .deserialize(&block_data)
             .map_err(|e| TPError::Protocol(format!("deserialize: {e}")))?;
 
         match self.chain.accept_block(&block) {

@@ -464,12 +464,15 @@ impl<T: TemplateProvider + Send + Sync + 'static> StratumServer<T> {
     ) -> JsonRpcNotify {
         let mut header = job.header.clone();
         header.miner_pubkey = self.accounting.reward_recipient_for_wallet(wallet_address);
-        let header_data = hyphen_codec::serialize(&header).unwrap_or_default();
-        let arena_params = hyphen_codec::serialize(&crate::server::ArenaParamsData {
-            arena_size: job.arena_size as u64,
-            page_size: job.page_size as u64,
-        })
-        .unwrap_or_default();
+        let header_data = crate::wire_config(crate::DEFAULT_WIRE_BYTES)
+            .serialize(&header)
+            .unwrap_or_default();
+        let arena_params = crate::wire_config(crate::DEFAULT_WIRE_BYTES)
+            .serialize(&crate::server::ArenaParamsData {
+                arena_size: job.arena_size as u64,
+                page_size: job.page_size as u64,
+            })
+            .unwrap_or_default();
 
         JsonRpcNotify {
             id: serde_json::Value::Null,

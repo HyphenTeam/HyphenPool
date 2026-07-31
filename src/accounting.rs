@@ -1243,14 +1243,12 @@ impl PoolAccounting {
     fn load_state(path: &Path) -> Option<AccountingState> {
         let raw = std::fs::read(path).ok()?;
         if let Some(encoded) = raw.strip_prefix(ACCOUNTING_STATE_MAGIC) {
-            return hyphen_codec::deserialize_with_limit::<AccountingState>(
-                encoded,
-                64 * 1024 * 1024,
-            )
-            .ok();
+            return crate::wire_config(64 * 1024 * 1024)
+                .deserialize::<AccountingState>(encoded)
+                .ok();
         }
         if let Ok(state) =
-            hyphen_codec::deserialize_with_limit::<LegacyAccountingStateV0>(&raw, 64 * 1024 * 1024)
+            crate::wire_config(64 * 1024 * 1024).deserialize::<LegacyAccountingStateV0>(&raw)
         {
             return Some(state.into());
         }
@@ -1297,7 +1295,8 @@ impl PoolAccounting {
             std::fs::create_dir_all(parent)
                 .map_err(|error| AccountingError::Persistence(error.to_string()))?;
         }
-        let encoded = hyphen_codec::serialize_with_limit(state, 64 * 1024 * 1024)
+        let encoded = crate::wire_config(64 * 1024 * 1024)
+            .serialize(state)
             .map_err(|error| AccountingError::Persistence(error.to_string()))?;
         let mut bytes = Vec::with_capacity(ACCOUNTING_STATE_MAGIC.len() + encoded.len());
         bytes.extend_from_slice(ACCOUNTING_STATE_MAGIC);
@@ -1692,7 +1691,9 @@ mod tests {
         };
         std::fs::write(
             test_dir.join("pool_accounting.bin"),
-            hyphen_codec::serialize(&legacy).unwrap(),
+            crate::wire_config(crate::DEFAULT_WIRE_BYTES)
+                .serialize(&legacy)
+                .unwrap(),
         )
         .unwrap();
         let mut config = sample_config();

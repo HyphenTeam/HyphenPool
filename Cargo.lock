@@ -589,15 +589,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hyphen-codec"
-version = "0.1.0"
-source = "git+https://github.com/HyphenTeam/Hyphen.git?rev=3a7effdc74b59bea1792116327e569e1d9bc9e21#3a7effdc74b59bea1792116327e569e1d9bc9e21"
-dependencies = [
- "serde",
- "thiserror",
-]
-
-[[package]]
 name = "hyphen-pool"
 version = "0.1.0"
 dependencies = [
@@ -609,10 +600,10 @@ dependencies = [
  "clap",
  "ed25519-dalek",
  "hex",
- "hyphen-codec",
  "parking_lot",
  "prost",
  "rand",
+ "rustbinary",
  "serde",
  "serde_json",
  "thiserror",
@@ -903,6 +894,27 @@ name = "regex-syntax"
 version = "0.8.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
+
+[[package]]
+name = "rustbinary"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b658eb55cca5a717eaa999d09ba641dc079d3213a5f36258ee272e29033135fc"
+dependencies = [
+ "rustbinary-derive",
+ "serde",
+]
+
+[[package]]
+name = "rustbinary-derive"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "21d5213a446a0842c329fb2161d81b67f0447f6043b3c8dc294028398d1b1b2c"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.3",
+]
 
 [[package]]
 name = "rustc_version"

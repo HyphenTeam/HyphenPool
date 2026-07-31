@@ -336,12 +336,15 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
             .accounting
             .get_view_public(&reward_spend_public)
             .unwrap_or([0u8; 32]);
-        let header_data = hyphen_codec::serialize(&header).expect("header serialisation");
-        let arena_params = hyphen_codec::serialize(&ArenaParamsData {
-            arena_size: job.arena_size as u64,
-            page_size: job.page_size as u64,
-        })
-        .expect("arena params serialisation");
+        let header_data = crate::wire_config(crate::DEFAULT_WIRE_BYTES)
+            .serialize(&header)
+            .expect("header serialisation");
+        let arena_params = crate::wire_config(crate::DEFAULT_WIRE_BYTES)
+            .serialize(&ArenaParamsData {
+                arena_size: job.arena_size as u64,
+                page_size: job.page_size as u64,
+            })
+            .expect("arena params serialisation");
 
         JobTemplate {
             job_id: job.job_id.to_vec(),
@@ -505,7 +508,7 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
             return;
         }
         let header: crate::primitives::BlockHeader =
-            match hyphen_codec::deserialize_with_limit(&tpl.header_data, 4096) {
+            match crate::wire_config(4096).deserialize(&tpl.header_data) {
                 Ok(header) => header,
                 Err(error) => {
                     warn!("Rejected template with invalid header: {error}");
@@ -1028,20 +1031,18 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                         block_hash: Vec::new(),
                     };
                 }
-                let authorization: BlockAuthorization = match hyphen_codec::deserialize_with_limit(
-                    &submission.block_authorization,
-                    256,
-                ) {
-                    Ok(authorization) => authorization,
-                    Err(error) => {
-                        return SubmitResult {
-                            accepted: false,
-                            error: format!("missing or malformed block authorization: {error}"),
-                            block_found: false,
-                            block_hash: Vec::new(),
-                        };
-                    }
-                };
+                let authorization: BlockAuthorization =
+                    match crate::wire_config(256).deserialize(&submission.block_authorization) {
+                        Ok(authorization) => authorization,
+                        Err(error) => {
+                            return SubmitResult {
+                                accepted: false,
+                                error: format!("missing or malformed block authorization: {error}"),
+                                block_found: false,
+                                block_hash: Vec::new(),
+                            };
+                        }
+                    };
                 let expected_view = self
                     .accounting
                     .get_view_public(&reward_recipient)
@@ -1120,7 +1121,7 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
 
                 let block_hash = block.hash();
 
-                let block_data = match hyphen_codec::serialize_with_limit(&block, 8 * 1024 * 1024) {
+                let block_data = match crate::wire_config(8 * 1024 * 1024).serialize(&block) {
                     Ok(data) => data,
                     Err(error) => {
                         self.job_manager.finish_block_submission(job.job_id, false);

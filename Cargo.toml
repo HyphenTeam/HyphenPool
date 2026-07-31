@@ -3,7 +3,7 @@ name = "hyphen-pool"
 version = "0.1.0"
 edition = "2021"
 authors = ["Hyphen Contributors"]
-license = "AGPL-3.0"
+license = "PSL-1.0.0"
 description = "Mining pool server for the Hyphen blockchain"
 
 [workspace]
@@ -20,7 +20,7 @@ chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.6.4", features = ["derive"] }
 ed25519-dalek = { version = "3.0.0", features = ["serde", "rand_core"] }
 hex = { version = "0.4", features = ["serde"] }
-hyphen-codec = { git = "https://github.com/HyphenTeam/Hyphen.git", rev = "3a7effdc74b59bea1792116327e569e1d9bc9e21" }
+rustbinary = { version = "0.1.2", features = ["derive"] }
 parking_lot = "0.12"
 prost = "0.14.4"
 rand = "0.10.2"

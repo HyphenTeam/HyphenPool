@@ -347,7 +347,9 @@ pub struct BlockHeader {
 
 impl BlockHeader {
     pub fn serialise_for_hash(&self) -> Vec<u8> {
-        hyphen_codec::serialize(self).expect("header serialisation infallible")
+        crate::wire_config(crate::DEFAULT_WIRE_BYTES)
+            .serialize(self)
+            .expect("header serialisation infallible")
     }
 
     pub fn hash(&self) -> Hash256 {
@@ -456,14 +458,23 @@ mod tests {
         let expected = vec![
             7, 2, 1, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 3, 4, 1, 9, 0, 0, 0,
         ];
-        assert_eq!(hyphen_codec::serialize(&fixture).unwrap(), expected);
         assert_eq!(
-            hyphen_codec::deserialize::<CodecFixture>(&expected).unwrap(),
+            crate::wire_config(crate::DEFAULT_WIRE_BYTES)
+                .serialize(&fixture)
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            crate::wire_config(crate::DEFAULT_WIRE_BYTES)
+                .deserialize::<CodecFixture>(&expected)
+                .unwrap(),
             fixture
         );
         let mut trailing = expected;
         trailing.push(0);
-        assert!(hyphen_codec::deserialize::<CodecFixture>(&trailing).is_err());
+        assert!(crate::wire_config(crate::DEFAULT_WIRE_BYTES)
+            .deserialize::<CodecFixture>(&trailing)
+            .is_err());
     }
 
     #[test]

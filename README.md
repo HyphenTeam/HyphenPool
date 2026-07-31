@@ -122,13 +122,14 @@ local health. A share count does not prove that a block or payout occurred.
 
 ## Protocol compatibility and fail-closed startup
 
-Consensus-facing types and `hyphen-codec` are pinned to the public Hyphen Git
-revision `3a7effdc74b59bea1792116327e569e1d9bc9e21`; there is no local path
-dependency. The legacy `--standalone` embedded chain is disabled and returns an
-error. Production startup requires a real main-chain Template Provider. If both
-the primary and backup ledgers fail canonical decoding, startup stops instead
-of silently replacing balances with an empty ledger. A legacy non-canonical map
-must be explicitly migrated; it is never accepted in a hash/signature path.
+Consensus-facing local types must remain synchronized with the main chain.
+Binary encoding uses RustBinary 0.1.2 with the same bounded, fixed-width,
+little-endian, trailing-byte-rejecting profile as Hyphen. The legacy
+`--standalone` embedded chain is disabled and returns an error. Production
+startup requires a real main-chain Template Provider. If both the primary and
+backup ledgers fail strict decoding, startup stops instead of silently replacing
+balances with an empty ledger. Format fallback is never accepted in a hash or
+signature path.
 
 ## CI and releases
 
@@ -217,14 +218,13 @@ Share 回执链把池公钥、矿工公钥、序号、前一回执、submission 
 
 ## 协议兼容性与启动失败关闭
 
-面向共识的类型和 `hyphen-codec` 固定到 Hyphen 公开 Git revision
-`3a7effdc74b59bea1792116327e569e1d9bc9e21`，不存在本地主链路径依赖。旧
-`--standalone` 内置链已禁用并返回错误，生产启动必须连接真实主链 Template Provider。
-主账本和备份均无法规范解码时，启动会停止，不会以空账本静默替换余额。旧的非规范
-map 必须显式迁移，绝不能进入哈希或签名路径。
+面向共识的本地类型必须与 Hyphen 主链保持同步。二进制编码使用 RustBinary 0.1.2，
+配置与主链相同：有界、固定宽度、小端并拒绝尾随字节。旧 `--standalone` 内置链已
+禁用并返回错误，生产启动必须连接真实主链 Template Provider。主账本和备份均无法
+严格解码时，启动会停止，不会以空账本静默替换余额。格式回退绝不能进入哈希或签名路径。
 
 ## CI 和 Release
 
 CI 执行格式检查、严格 Clippy、全部测试和锁定依赖的 release build。只有 `main` 的 CI 成功后才自动构建 Linux、Windows、macOS 包，附提交号、工具链、调试信息和 SHA-256，并创建 commit-bound prerelease。
 
-本仓库使用 AGPL-3.0。`pool.key`、payout token、钱包 seed 和状态备份都属于敏感数据。
+本仓库使用 PolyForm Strict License 1.0.0。`pool.key`、payout token、钱包 seed 和状态备份都属于敏感数据。
