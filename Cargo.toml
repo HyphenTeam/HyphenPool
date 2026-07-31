@@ -13,23 +13,23 @@ name = "hyphen-pool-server"
 path = "src/bin/pool_server.rs"
 
 [dependencies]
-async-trait = "0.1"
-axum = "0.8"
-bincode = "1"
-blake3 = "1.8"
-chrono = { version = "0.4", features = ["serde"] }
-clap = { version = "4", features = ["derive"] }
-ed25519-dalek = { version = "2.1", features = ["serde", "rand_core"] }
+async-trait = "0.1.91"
+axum = "0.8.9"
+blake3 = "1.8.5"
+chrono = { version = "0.4.45", features = ["serde"] }
+clap = { version = "4.6.4", features = ["derive"] }
+ed25519-dalek = { version = "3.0.0", features = ["serde", "rand_core"] }
 hex = { version = "0.4", features = ["serde"] }
+hyphen-codec = { git = "https://github.com/HyphenTeam/Hyphen.git", rev = "3a7effdc74b59bea1792116327e569e1d9bc9e21" }
 parking_lot = "0.12"
-prost = "0.13"
-rand = "0.8"
-serde = { version = "1", features = ["derive"] }
-thiserror = "1"
-tokio = { version = "1", features = ["full"] }
-serde_json = "1"
+prost = "0.14.4"
+rand = "0.10.2"
+serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "2.0.19"
+tokio = { version = "1.53.1", features = ["full"] }
+serde_json = "1.0.151"
 bs58 = "0.5"
-tower-http = { version = "0.6", features = ["cors"] }
+tower-http = { version = "0.7.0", features = ["cors"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-zeroize = { version = "1", features = ["derive"] }
+zeroize = { version = "1.9.0", features = ["derive"] }

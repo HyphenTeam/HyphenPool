@@ -336,8 +336,8 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
             .accounting
             .get_view_public(&reward_spend_public)
             .unwrap_or([0u8; 32]);
-        let header_data = bincode::serialize(&header).expect("header serialisation");
-        let arena_params = bincode::serialize(&ArenaParamsData {
+        let header_data = hyphen_codec::serialize(&header).expect("header serialisation");
+        let arena_params = hyphen_codec::serialize(&ArenaParamsData {
             arena_size: job.arena_size as u64,
             page_size: job.page_size as u64,
         })
@@ -504,13 +504,14 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
             warn!("Rejected malformed or incompatible node template");
             return;
         }
-        let header: crate::primitives::BlockHeader = match bincode::deserialize(&tpl.header_data) {
-            Ok(header) => header,
-            Err(error) => {
-                warn!("Rejected template with invalid header: {error}");
-                return;
-            }
-        };
+        let header: crate::primitives::BlockHeader =
+            match hyphen_codec::deserialize_with_limit(&tpl.header_data, 4096) {
+                Ok(header) => header,
+                Err(error) => {
+                    warn!("Rejected template with invalid header: {error}");
+                    return;
+                }
+            };
         if header.version != FROZEN_BLOCK_VERSION
             || header.height != tpl.height
             || header.difficulty != tpl.difficulty
@@ -1027,18 +1028,20 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                         block_hash: Vec::new(),
                     };
                 }
-                let authorization: BlockAuthorization =
-                    match bincode::deserialize(&submission.block_authorization) {
-                        Ok(authorization) => authorization,
-                        Err(error) => {
-                            return SubmitResult {
-                                accepted: false,
-                                error: format!("missing or malformed block authorization: {error}"),
-                                block_found: false,
-                                block_hash: Vec::new(),
-                            };
-                        }
-                    };
+                let authorization: BlockAuthorization = match hyphen_codec::deserialize_with_limit(
+                    &submission.block_authorization,
+                    256,
+                ) {
+                    Ok(authorization) => authorization,
+                    Err(error) => {
+                        return SubmitResult {
+                            accepted: false,
+                            error: format!("missing or malformed block authorization: {error}"),
+                            block_found: false,
+                            block_hash: Vec::new(),
+                        };
+                    }
+                };
                 let expected_view = self
                     .accounting
                     .get_view_public(&reward_recipient)
@@ -1117,7 +1120,18 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
 
                 let block_hash = block.hash();
 
-                let block_data = bincode::serialize(&block).unwrap_or_default();
+                let block_data = match hyphen_codec::serialize_with_limit(&block, 8 * 1024 * 1024) {
+                    Ok(data) => data,
+                    Err(error) => {
+                        self.job_manager.finish_block_submission(job.job_id, false);
+                        return SubmitResult {
+                            accepted: false,
+                            error: format!("block encoding failed: {error}"),
+                            block_found: false,
+                            block_hash: Vec::new(),
+                        };
+                    }
+                };
                 let tp = Arc::clone(&self.tp_client);
                 let self_ref = Arc::clone(self);
                 let job_id = job.job_id;

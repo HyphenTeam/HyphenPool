@@ -7,7 +7,6 @@ use tracing::info;
 
 use hyphen_pool::accounting::{PoolAccounting, PoolAccountingConfig, PoolMode};
 use hyphen_pool::api::start_pool_api;
-use hyphen_pool::chain::StandaloneProvider;
 use hyphen_pool::job::JobManager;
 use hyphen_pool::payout::{load_token_file, PayoutAgentClient, PayoutWorker, PayoutWorkerConfig};
 use hyphen_pool::primitives::{ChainConfig, SecretKey};
@@ -57,11 +56,11 @@ struct Cli {
     #[arg(long, default_value = "")]
     key_file: String,
 
-    /// Run in standalone mode (internal chain state, no external node)
+    /// Retired compatibility flag. Standalone consensus is intentionally rejected.
     #[arg(long)]
     standalone: bool,
 
-    /// Data directory for chain state persistence (standalone mode)
+    /// Retained for CLI compatibility; standalone consensus is no longer executable.
     #[arg(long, default_value = "data")]
     data_dir: String,
 
@@ -160,6 +159,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if cli.share_difficulty == 0 {
         return Err("--share-difficulty must be greater than zero".into());
     }
+    if cli.standalone {
+        return Err(
+            "--standalone is disabled because its historical internal chain is not consensus-compatible; run a Hyphen node Template Provider instead"
+                .into(),
+        );
+    }
     if cli.pool_fee_bps.unwrap_or(0) > 10_000 {
         return Err("--pool-fee-bps cannot exceed 10000".into());
     }
@@ -235,7 +240,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cli.payout_mode, pool_fee_bps, cli.pplns_window_factor,
     );
 
-    let accounting = Arc::new(PoolAccounting::new(PoolAccountingConfig {
+    let accounting = Arc::new(PoolAccounting::try_new(PoolAccountingConfig {
         mode: cli.payout_mode,
         pool_fee_bps,
         pool_wallet: pool_pubkey,
@@ -243,66 +248,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         network_magic: cfg.network_magic,
         pplns_window_factor: cli.pplns_window_factor,
         state_dir: Some(PathBuf::from(&cli.pool_state_dir)),
-    }));
+    })?);
     let job_manager = Arc::new(JobManager::with_pool_pubkey(
         cli.share_difficulty,
         pool_pubkey,
     ));
 
-    if cli.standalone {
-        run_standalone(
-            cli,
-            cfg,
-            sk,
-            bind_addr,
-            stratum_addr,
-            api_addr,
-            job_manager,
-            accounting,
-        )
-        .await
-    } else {
-        run_with_node(
-            cli,
-            cfg,
-            sk,
-            bind_addr,
-            stratum_addr,
-            api_addr,
-            job_manager,
-            accounting,
-        )
-        .await
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run_standalone(
-    cli: Cli,
-    cfg: ChainConfig,
-    sk: SecretKey,
-    bind_addr: SocketAddr,
-    stratum_addr: SocketAddr,
-    api_addr: SocketAddr,
-    job_manager: Arc<JobManager>,
-    accounting: Arc<PoolAccounting>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    info!("Starting in STANDALONE mode (internal chain state)");
-
-    let data_dir = PathBuf::from(&cli.data_dir);
-    let tp = Arc::new(StandaloneProvider::new(
-        cfg.clone(),
-        Some(data_dir),
-        sk.clone(),
-    ));
-
-    info!(
-        "Chain tip: height={}, difficulty={}",
-        tp.chain().tip_height(),
-        tp.chain().current_difficulty()
-    );
-
-    start_pool_and_stratum(
+    run_with_node(
         cli,
         cfg,
         sk,
@@ -311,7 +263,6 @@ async fn run_standalone(
         api_addr,
         job_manager,
         accounting,
-        tp,
     )
     .await
 }

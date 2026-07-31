@@ -41,7 +41,7 @@ impl JobManager {
     }
 
     pub fn ingest_template(&self, tpl: &BlockTemplate) -> Result<ActiveJob, String> {
-        let header: BlockHeader = bincode::deserialize(&tpl.header_data)
+        let header: BlockHeader = hyphen_codec::deserialize_with_limit(&tpl.header_data, 4096)
             .map_err(|e| format!("header deserialise: {e}"))?;
 
         if tpl.template_id.len() != 32 {

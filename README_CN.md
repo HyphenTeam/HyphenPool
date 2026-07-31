@@ -1,3 +1,12 @@
+# Hyphen Pool (Chinese Compatibility Entry)
+
+This compatibility entry preserves the Chinese documentation URL. The complete
+English-first, Chinese-second README is available in [README.md](README.md).
+
+---
+
+<!-- hyphen-bilingual-chinese -->
+
 # Hyphen Pool
 
 [English](README.md)
@@ -66,7 +75,7 @@ Share 回执链把池公钥、矿工公钥、序号、前一回执、submission 
 
 分别备份 `pool.key`、Pool 账本目录、payout-agent 状态和池钱包 seed。不要把运行中的目录复制品当成原子备份。监控 pending、reserved、paid 三类余额；reserved 持续增长表示广播、节点连接或确认跟踪发生故障。
 
-完整参数以 `hyphen-pool-server --help` 为准。`/healthz` 只说明进程健康；share 增长不证明已找到区块或已经付款。Accounting API 不应直接暴露公网。
+完整参数以 `hyphen-pool-server --help` 为准。旧 `--standalone` 内置链已 fail-closed 禁用；生产入口必须连接真实 Template Provider。账本主文件和备份同时损坏或无法规范解码时，进程必须停止，不能以空账本继续。`/healthz` 只说明进程健康；share 增长不证明已找到区块或已经付款。Accounting API 不应直接暴露公网。
 
 ## CI 和 Release
 

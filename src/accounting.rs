@@ -333,14 +333,25 @@ pub struct PoolAccounting {
 
 impl PoolAccounting {
     pub fn new(config: PoolAccountingConfig) -> Self {
+        Self::try_new(config).expect("existing pool accounting state must be readable")
+    }
+
+    pub fn try_new(config: PoolAccountingConfig) -> Result<Self, AccountingError> {
         let state_path = config
             .state_dir
             .as_ref()
             .map(|dir| dir.join("pool_accounting.bin"));
-        let state = state_path
-            .as_ref()
-            .and_then(|path| Self::load_state_with_backup(path))
-            .unwrap_or_else(|| AccountingState::new(&config));
+        let state = match state_path.as_ref() {
+            Some(path) if path.exists() || persistence_sidecar(path, "bak").exists() => {
+                Self::load_state_with_backup(path).ok_or_else(|| {
+                    AccountingError::Persistence(format!(
+                        "neither {} nor its backup contains a valid bounded canonical state",
+                        path.display()
+                    ))
+                })?
+            }
+            _ => AccountingState::new(&config),
+        };
         let mut view_keys = HashMap::new();
         if config.pool_view_public != [0u8; 32] {
             view_keys.insert(config.pool_wallet, config.pool_view_public);
@@ -350,12 +361,12 @@ impl PoolAccounting {
                 view_keys.insert(ledger.wallet_address, ledger.wallet_view_public);
             }
         }
-        Self {
+        Ok(Self {
             state: RwLock::new(state),
             state_path,
             network_magic: config.network_magic,
             view_keys: RwLock::new(view_keys),
-        }
+        })
     }
 
     pub fn mode(&self) -> PoolMode {
@@ -1232,9 +1243,15 @@ impl PoolAccounting {
     fn load_state(path: &Path) -> Option<AccountingState> {
         let raw = std::fs::read(path).ok()?;
         if let Some(encoded) = raw.strip_prefix(ACCOUNTING_STATE_MAGIC) {
-            return bincode::deserialize::<AccountingState>(encoded).ok();
+            return hyphen_codec::deserialize_with_limit::<AccountingState>(
+                encoded,
+                64 * 1024 * 1024,
+            )
+            .ok();
         }
-        if let Ok(state) = bincode::deserialize::<LegacyAccountingStateV0>(&raw) {
+        if let Ok(state) =
+            hyphen_codec::deserialize_with_limit::<LegacyAccountingStateV0>(&raw, 64 * 1024 * 1024)
+        {
             return Some(state.into());
         }
         let text = std::str::from_utf8(&raw).ok()?;
@@ -1280,7 +1297,7 @@ impl PoolAccounting {
             std::fs::create_dir_all(parent)
                 .map_err(|error| AccountingError::Persistence(error.to_string()))?;
         }
-        let encoded = bincode::serialize(state)
+        let encoded = hyphen_codec::serialize_with_limit(state, 64 * 1024 * 1024)
             .map_err(|error| AccountingError::Persistence(error.to_string()))?;
         let mut bytes = Vec::with_capacity(ACCOUNTING_STATE_MAGIC.len() + encoded.len());
         bytes.extend_from_slice(ACCOUNTING_STATE_MAGIC);
@@ -1482,6 +1499,28 @@ mod tests {
     }
 
     #[test]
+    fn refuses_to_replace_unreadable_existing_ledgers() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "hyphen_pool_fail_closed_{}_{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let primary = test_dir.join("pool_accounting.bin");
+        std::fs::write(&primary, b"corrupt-primary").unwrap();
+        std::fs::write(persistence_sidecar(&primary, "bak"), b"corrupt-backup").unwrap();
+
+        let mut config = sample_config();
+        config.state_dir = Some(test_dir.clone());
+        assert!(matches!(
+            PoolAccounting::try_new(config),
+            Err(AccountingError::Persistence(_))
+        ));
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
     fn duplicate_block_settlement_is_idempotent() {
         let mut config = sample_config();
         config.mode = PoolMode::Solo;
@@ -1653,7 +1692,7 @@ mod tests {
         };
         std::fs::write(
             test_dir.join("pool_accounting.bin"),
-            bincode::serialize(&legacy).unwrap(),
+            hyphen_codec::serialize(&legacy).unwrap(),
         )
         .unwrap();
         let mut config = sample_config();
