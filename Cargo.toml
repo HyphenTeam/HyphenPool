@@ -3,7 +3,7 @@ name = "hyphen-pool"
 version = "0.1.0"
 edition = "2021"
 authors = ["Hyphen Contributors"]
-license = "PSL-1.0.0"
+license = "PolyForm-Strict-1.0.0"
 description = "Mining pool server for the Hyphen blockchain"
 
 [workspace]

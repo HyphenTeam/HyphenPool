@@ -76,7 +76,7 @@ impl TemplateProviderClient {
         let req = TemplateRequest {
             requester_pubkey: self.sk.public_key().as_bytes().to_vec(),
             network_magic: self.cfg.network_magic.to_vec(),
-            protocol_version: 2,
+            protocol_version: 3,
             consensus_params_hash: self.cfg.consensus_params_hash().to_vec(),
             genesis_hash: self.cfg.genesis_hash().to_vec(),
         };
@@ -127,7 +127,7 @@ impl TemplateProvider for TemplateProviderClient {
         let req = TemplateRequest {
             requester_pubkey: self.sk.public_key().as_bytes().to_vec(),
             network_magic: self.cfg.network_magic.to_vec(),
-            protocol_version: 2,
+            protocol_version: 3,
             consensus_params_hash: self.cfg.consensus_params_hash().to_vec(),
             genesis_hash: self.cfg.genesis_hash().to_vec(),
         };

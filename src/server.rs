@@ -24,8 +24,8 @@ use crate::share::{verify_share, ShareVerdict};
 const VARDIFF_TARGET_SECS: f64 = 15.0;
 /// Minimum share difficulty
 const VARDIFF_MIN: u64 = 10;
-/// Maximum share difficulty (2^48, higher than any testnet block difficulty)
-const VARDIFF_MAX: u64 = 1 << 48;
+/// A checkpoint can never exceed the consensus iteration ceiling.
+const VARDIFF_MAX: u64 = crate::pow::MAX_POUW_ITERATIONS;
 /// Number of shares to look back for rate calculation
 const VARDIFF_WINDOW: usize = 24;
 /// Retarget check interval (after this many shares)
@@ -91,7 +91,7 @@ impl VarDiffState {
     /// At n=W:  d ≈ 0.993 · d_target  (within 1% of target)
     fn warmup_difficulty(total_shares: u64, target_diff: u64) -> u64 {
         if total_shares >= GTM_WARMUP_SHARES {
-            return target_diff;
+            return target_diff.clamp(VARDIFF_MIN, VARDIFF_MAX);
         }
         let ratio = 5.0 * total_shares as f64 / GTM_WARMUP_SHARES as f64;
         let factor = 1.0 - (-ratio).exp();
@@ -205,15 +205,17 @@ pub struct ArenaParamsData {
 }
 
 impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
-    fn recommended_share_difficulty(hashrate: u64, thread_count: u32) -> u64 {
-        if hashrate > 0 {
-            (hashrate as f64 * VARDIFF_TARGET_SECS)
+    fn recommended_share_difficulty(operations_per_second: u64, thread_count: u32) -> u64 {
+        const OPERATIONS_PER_ITERATION: f64 = (crate::pow::POUW_CELL_COUNT as u64
+            * crate::pow::POUW_ARITHMETIC_OPERATIONS_PER_CELL)
+            as f64;
+        if operations_per_second > 0 {
+            (operations_per_second as f64 * VARDIFF_TARGET_SECS / OPERATIONS_PER_ITERATION)
                 .round()
                 .max(VARDIFF_MIN as f64)
                 .min(VARDIFF_MAX as f64) as u64
         } else if thread_count > 0 {
-            let rough_hps = thread_count as u64 * 10;
-            (rough_hps * VARDIFF_TARGET_SECS as u64).clamp(VARDIFF_MIN, VARDIFF_MAX)
+            (thread_count as u64 * VARDIFF_INITIAL).clamp(VARDIFF_MIN, VARDIFF_MAX)
         } else {
             VARDIFF_INITIAL
         }
@@ -331,6 +333,7 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
     ) -> JobTemplate {
         let mut header = job.header.clone();
         header.miner_pubkey = miner_pubkey;
+        let share_difficulty = share_difficulty.clamp(1, header.difficulty);
         let reward_spend_public = self.accounting.reward_recipient_for_wallet(wallet_address);
         let reward_view_public = self
             .accounting
@@ -485,7 +488,7 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
     }
 
     fn apply_template(&self, tpl: &BlockTemplate) {
-        if tpl.protocol_version != 2
+        if tpl.protocol_version != 3
             || tpl.network_magic.as_slice() != self.cfg.network_magic
             || tpl.consensus_params_hash.as_slice() != self.cfg.consensus_params_hash()
             || tpl.genesis_hash.as_slice() != self.cfg.genesis_hash()
@@ -604,10 +607,12 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
             login.thread_count,
         );
 
-        let initial_diff =
-            Self::recommended_share_difficulty(login.estimated_hashrate, login.thread_count);
+        let initial_diff = Self::recommended_share_difficulty(
+            login.estimated_operations_per_second,
+            login.thread_count,
+        );
 
-        // GTM: new miners start at VARDIFF_INITIAL regardless of reported hashrate;
+        // New miners start at VARDIFF_INITIAL while compute-rate telemetry warms up.
         // the estimated target is stored so the warmup ramp has something to aim for.
         let gtm_initial = VARDIFF_INITIAL;
 
@@ -782,13 +787,13 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                             }
                         }
                         MSG_KEEPALIVE => {}
-                        MSG_HASHRATE_REPORT => {
-                            if let Ok(report) = HashrateReport::decode(&env.payload[..]) {
+                        MSG_COMPUTE_RATE_REPORT => {
+                            if let Ok(report) = ComputeRateReport::decode(&env.payload[..]) {
                                 info!(
-                                    "Hashrate report from {}: {} H/s, total={}, uptime={}s",
+                                    "Scientific compute report from {}: {} ops/s, total={}, uptime={}s",
                                     hex::encode(miner_pk),
-                                    report.hashrate,
-                                    report.total_hashes,
+                                    report.operations_per_second,
+                                    report.total_operations,
                                     report.uptime_secs,
                                 );
 
@@ -796,7 +801,7 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                                     let mut miners = self.miners.write();
                                     miners.get_mut(&miner_pk).and_then(|session| {
                                         let recommended = Self::recommended_share_difficulty(
-                                            report.hashrate,
+                                            report.operations_per_second,
                                             session.thread_count,
                                         );
                                         let current = session.vardiff.current_difficulty.max(1);
@@ -824,10 +829,10 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
 
                                 if let Some(diff) = new_diff {
                                     info!(
-                                        "VarDiff report update: miner {} -> share_diff={} (hashrate={} H/s)",
+                                        "Checkpoint update: miner {} -> iterations={} (compute={} ops/s)",
                                         hex::encode(miner_pk),
                                         diff,
-                                        report.hashrate,
+                                        report.operations_per_second,
                                     );
                                     let set_msg = SetDifficulty {
                                         share_difficulty: diff,
@@ -1012,21 +1017,28 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
             }
         };
 
+        let effective_share_diff = effective_share_diff.clamp(1, effective_header.difficulty);
+        let verification_iterations = if submission.block_authorization.is_empty() {
+            effective_share_diff
+        } else {
+            effective_header.difficulty
+        };
         let verdict = verify_share(
             &effective_header,
             submission.nonce,
             &extra_nonce,
             &arena,
             &self.cfg,
-            effective_share_diff,
+            verification_iterations,
         );
 
         match verdict {
             ShareVerdict::BlockFound { hash } => {
-                if submission.pow_hash.as_slice() != hash.as_bytes() {
+                if submission.work_commitment.as_slice() != hash.as_bytes() {
                     return SubmitResult {
                         accepted: false,
-                        error: "submitted PoW hash does not match recomputed block hash".into(),
+                        error: "submitted scientific-work commitment does not match recomputation"
+                            .into(),
                         block_found: false,
                         block_hash: Vec::new(),
                     };
@@ -1062,6 +1074,7 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                 let mut authorized_header = effective_header.clone();
                 authorized_header.nonce = submission.nonce;
                 authorized_header.extra_nonce = extra_nonce;
+                authorized_header.pow_commitment = hash;
                 if let Err(error) = authorization.verify(&authorized_header, &self.cfg) {
                     return SubmitResult {
                         accepted: false,
@@ -1095,18 +1108,21 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                     hash
                 );
 
-                self.accounting.record_valid_share(
-                    *miner_pk,
-                    wallet_address,
-                    effective_share_diff,
-                    effective_header.difficulty,
-                    effective_header.reward,
-                    effective_header.total_fee,
-                );
+                if effective_share_diff == effective_header.difficulty {
+                    self.accounting.record_valid_share(
+                        *miner_pk,
+                        wallet_address,
+                        effective_share_diff,
+                        effective_header.difficulty,
+                        effective_header.reward,
+                        effective_header.total_fee,
+                    );
+                }
 
                 let mut mined_header = effective_header.clone();
                 mined_header.nonce = submission.nonce;
                 mined_header.extra_nonce = extra_nonce;
+                mined_header.pow_commitment = hash;
                 let block_height = mined_header.height;
                 let block_reward = mined_header.reward;
                 let block_total_fee = mined_header.total_fee;
@@ -1201,12 +1217,12 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
             }
 
             ShareVerdict::ValidShare { hash } => {
-                if submission.pow_hash.as_slice() != hash.as_bytes()
+                if submission.work_commitment.as_slice() != hash.as_bytes()
                     || !submission.block_authorization.is_empty()
                 {
                     return SubmitResult {
                         accepted: false,
-                        error: "share hash mismatch or unexpected block authorization".into(),
+                        error: "scientific checkpoint commitment mismatch".into(),
                         block_found: false,
                         block_hash: Vec::new(),
                     };
@@ -1249,5 +1265,22 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vardiff_warmup_never_exceeds_consensus_iterations() {
+        assert_eq!(
+            VarDiffState::warmup_difficulty(GTM_WARMUP_SHARES - 1, u64::MAX),
+            VARDIFF_MAX
+        );
+        assert_eq!(
+            VarDiffState::warmup_difficulty(GTM_WARMUP_SHARES, u64::MAX),
+            VARDIFF_MAX
+        );
     }
 }

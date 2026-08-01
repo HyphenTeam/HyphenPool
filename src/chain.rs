@@ -6,7 +6,7 @@ use parking_lot::RwLock;
 use prost::Message;
 use tracing::{info, warn};
 
-use crate::pow::{difficulty_to_target, evaluate_pow, EpochArena};
+use crate::pow::{evaluate_pow, EpochArena};
 use crate::primitives::{
     blake3_hash, blake3_hash_many, Block, BlockHeader, ChainConfig, Hash256, SecretKey,
 };
@@ -203,7 +203,7 @@ impl ChainState {
             state_root: Hash256::ZERO,
             receipt_root: Hash256::ZERO,
             uncle_root: Hash256::ZERO,
-            pow_commitment: blake3_hash(tip.epoch_seed.as_bytes()),
+            pow_commitment: Hash256::ZERO,
             epoch_seed: tip.epoch_seed,
             difficulty: next_difficulty,
             nonce: 0,
@@ -238,7 +238,7 @@ impl ChainState {
             page_size: self.cfg.page_size as u64,
             clean: true,
             network_magic: self.cfg.network_magic.to_vec(),
-            protocol_version: 2,
+            protocol_version: 3,
             consensus_params_hash: self.cfg.consensus_params_hash().to_vec(),
             genesis_hash: self.cfg.genesis_hash().to_vec(),
         }
@@ -273,10 +273,9 @@ impl ChainState {
         }
 
         let arena = self.get_arena(tip.epoch_seed);
-        let pow_hash = evaluate_pow(&block.header, &arena, &self.cfg);
-        let target = difficulty_to_target(block.header.difficulty);
-        if !hash_below_target(&pow_hash, &target) {
-            return Err("PoW hash does not meet difficulty target".into());
+        let work_commitment = evaluate_pow(&block.header, &arena, &self.cfg);
+        if work_commitment == Hash256::ZERO || work_commitment != block.header.pow_commitment {
+            return Err("scientific PoUW commitment verification failed".into());
         }
 
         let block_hash = block.hash();
@@ -393,6 +392,7 @@ impl ChainState {
         let down = cur.saturating_sub(cur / self.cfg.difficulty_clamp_down);
 
         next.clamp(down.max(1), up)
+            .min(crate::pow::MAX_POUW_ITERATIONS)
     }
 
     fn calculate_reward(&self, height: u64) -> u64 {
@@ -406,17 +406,6 @@ impl ChainState {
         let reward = self.cfg.initial_reward >> halvings;
         reward.max(self.cfg.tail_emission)
     }
-}
-
-fn hash_below_target(hash: &Hash256, target: &[u8; 32]) -> bool {
-    for (h, t) in hash.as_bytes().iter().zip(target.iter()) {
-        match h.cmp(t) {
-            std::cmp::Ordering::Less => return true,
-            std::cmp::Ordering::Greater => return false,
-            std::cmp::Ordering::Equal => continue,
-        }
-    }
-    true
 }
 
 pub struct StandaloneProvider {

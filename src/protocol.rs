@@ -161,9 +161,9 @@ pub const MSG_SUBMIT_RESULT: u32 = 5;
 pub const MSG_KEEPALIVE: u32 = 6;
 pub const MSG_BLOCK_FOUND: u32 = 7;
 pub const MSG_SET_DIFFICULTY: u32 = 8;
-pub const MSG_HASHRATE_REPORT: u32 = 9;
+pub const MSG_COMPUTE_RATE_REPORT: u32 = 9;
 pub const MSG_CHAIN_STATE: u32 = 10;
-pub const POOL_PROTOCOL_VERSION: u32 = 3;
+pub const POOL_PROTOCOL_VERSION: u32 = 5;
 
 #[derive(Clone, prost::Message)]
 pub struct LoginRequest {
@@ -174,7 +174,7 @@ pub struct LoginRequest {
     #[prost(bytes = "vec", tag = "3")]
     pub payout_pubkey: Vec<u8>,
     #[prost(uint64, tag = "4")]
-    pub estimated_hashrate: u64,
+    pub estimated_operations_per_second: u64,
     #[prost(uint32, tag = "5")]
     pub thread_count: u32,
     #[prost(bytes = "vec", tag = "6")]
@@ -218,11 +218,11 @@ pub struct LoginAck {
 }
 
 #[derive(Clone, prost::Message)]
-pub struct HashrateReport {
+pub struct ComputeRateReport {
     #[prost(uint64, tag = "1")]
-    pub hashrate: u64,
+    pub operations_per_second: u64,
     #[prost(uint64, tag = "2")]
-    pub total_hashes: u64,
+    pub total_operations: u64,
     #[prost(uint64, tag = "3")]
     pub uptime_secs: u64,
 }
@@ -282,7 +282,7 @@ pub struct ShareSubmission {
     #[prost(bytes = "vec", tag = "3")]
     pub extra_nonce: Vec<u8>,
     #[prost(bytes = "vec", tag = "4")]
-    pub pow_hash: Vec<u8>,
+    pub work_commitment: Vec<u8>,
     /// Present only for a full block solution. Encodes BlockAuthorization.
     #[prost(bytes = "vec", tag = "5")]
     pub block_authorization: Vec<u8>,

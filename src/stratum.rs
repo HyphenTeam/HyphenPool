@@ -44,7 +44,6 @@ struct StratumSession {
     extranonce1: [u8; 4],
     wallet_address: [u8; 32],
     authorized: bool,
-    shares: u64,
     invalid: u64,
 }
 
@@ -180,7 +179,6 @@ impl<T: TemplateProvider + Send + Sync + 'static> StratumServer<T> {
                 extranonce1: en1,
                 wallet_address: [0u8; 32],
                 authorized: false,
-                shares: 0,
                 invalid: 0,
             },
         );
@@ -421,29 +419,14 @@ impl<T: TemplateProvider + Send + Sync + 'static> StratumServer<T> {
                 );
                 fail(
                     24,
-                    "legacy Stratum is share-only and cannot submit frozen-v2 blocks; use pool protocol v3",
+                    "legacy Stratum cannot carry frozen-v3 scientific PoUW authorization; use pool protocol v5",
                 )
             }
 
-            ShareVerdict::ValidShare { .. } => {
-                self.accounting.record_valid_share(
-                    wallet_address,
-                    wallet_address,
-                    job.share_difficulty,
-                    effective_header.difficulty,
-                    effective_header.reward,
-                    effective_header.total_fee,
-                );
-                if let Some(s) = self.sessions.write().get_mut(&sid) {
-                    s.shares += 1;
-                }
-
-                JsonRpcResponse {
-                    id: req.id.clone(),
-                    result: serde_json::json!(true),
-                    error: serde_json::Value::Null,
-                }
-            }
+            ShareVerdict::ValidShare { .. } => fail(
+                24,
+                "legacy Stratum does not carry a scientific-work commitment; use pool protocol v5",
+            ),
 
             ShareVerdict::Invalid(reason) => {
                 self.accounting.record_invalid_share(wallet_address);
