@@ -4,6 +4,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex};
 use tracing::warn;
 
+use crate::primitives::ChainIdentity;
 use crate::primitives::{ChainConfig, SecretKey};
 use crate::tp::{
     read_envelope, write_envelope, BlockTemplate, DeclareJobRequest, DeclareJobResult,
@@ -49,7 +50,9 @@ impl TemplateProviderClient {
 
             match response {
                 Ok(response) => {
-                    response.verify()?;
+                    if !response.verify() {
+                        return Err(TPError::Protocol("invalid envelope signature".into()));
+                    }
                     if response.msg_type != expected_type {
                         return Err(TPError::Protocol(format!(
                             "expected response type {expected_type}, got {}",
@@ -76,9 +79,12 @@ impl TemplateProviderClient {
         let req = TemplateRequest {
             requester_pubkey: self.sk.public_key().as_bytes().to_vec(),
             network_magic: self.cfg.network_magic.to_vec(),
-            protocol_version: 3,
+            protocol_version: hyphen_transport::POOL_PROTOCOL_VERSION,
             consensus_params_hash: self.cfg.consensus_params_hash().to_vec(),
-            genesis_hash: self.cfg.genesis_hash().to_vec(),
+            genesis_hash: ChainIdentity::of(&self.cfg)
+                .genesis_hash
+                .as_bytes()
+                .to_vec(),
         };
         let env = SignedEnvelope::sign(TP_SUBSCRIBE, req.encode_to_vec(), &self.sk);
         write_envelope(&mut stream, &env).await?;
@@ -95,8 +101,8 @@ impl TemplateProviderClient {
             loop {
                 match read_envelope(&mut stream).await {
                     Ok(env) if env.msg_type == TP_TEMPLATE => {
-                        if let Err(error) = env.verify() {
-                            warn!("Rejected invalid template envelope: {error}");
+                        if !env.verify() {
+                            warn!("Rejected template envelope with an invalid signature");
                             continue;
                         }
                         if template_tx.send(env).is_err() {
@@ -127,9 +133,12 @@ impl TemplateProvider for TemplateProviderClient {
         let req = TemplateRequest {
             requester_pubkey: self.sk.public_key().as_bytes().to_vec(),
             network_magic: self.cfg.network_magic.to_vec(),
-            protocol_version: 3,
+            protocol_version: hyphen_transport::POOL_PROTOCOL_VERSION,
             consensus_params_hash: self.cfg.consensus_params_hash().to_vec(),
-            genesis_hash: self.cfg.genesis_hash().to_vec(),
+            genesis_hash: ChainIdentity::of(&self.cfg)
+                .genesis_hash
+                .as_bytes()
+                .to_vec(),
         };
         let env = SignedEnvelope::sign(TP_GET_TEMPLATE, req.encode_to_vec(), &self.sk);
         let resp = self.request_response(env, TP_TEMPLATE).await?;

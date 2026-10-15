@@ -14,6 +14,7 @@ use crate::accounting::{
     BlockSettlement, PayoutRecord, PayoutStatus, PoolAccounting, PoolMode, RewardEventKind,
     WalletLedgerSummary, WalletRewardEvent,
 };
+use crate::primitives::hex_encode;
 
 const ATOMIC_UNITS: u128 = 1_000_000_000_000;
 
@@ -135,9 +136,9 @@ fn map_summary(summary: WalletLedgerSummary) -> WalletBalanceResponse {
         .saturating_add(summary.total_paid_atomic);
 
     WalletBalanceResponse {
-        wallet_address: hex::encode(summary.wallet_address),
+        wallet_address: hex_encode(summary.wallet_address),
         mode: summary.mode,
-        pool_wallet: hex::encode(summary.pool_wallet),
+        pool_wallet: hex_encode(summary.pool_wallet),
         is_pool_wallet: summary.is_pool_wallet,
         direct_coinbase_mode: summary.direct_coinbase_mode,
         pool_fee_bps: summary.pool_fee_bps,
@@ -182,14 +183,14 @@ fn map_block(block: BlockSettlement) -> WalletBlockSettlement {
     WalletBlockSettlement {
         height: block.height,
         block_hash_hex: block.block_hash_hex,
-        reward_recipient: hex::encode(block.reward_recipient),
+        reward_recipient: hex_encode(block.reward_recipient),
         direct_coinbase: block.direct_coinbase,
         gross_reward_atomic: block.gross_reward_atomic,
         total_fee_atomic: block.total_fee_atomic,
         distributed_atomic: block.distributed_atomic.to_string(),
         pool_fee_atomic: block.pool_fee_atomic.to_string(),
         timestamp: block.timestamp,
-        finder_pubkey: hex::encode(block.finder_pubkey),
+        finder_pubkey: hex_encode(block.finder_pubkey),
     }
 }
 
@@ -197,9 +198,9 @@ fn map_reward_event(event: WalletRewardEvent) -> WalletRewardEventResponse {
     WalletRewardEventResponse {
         height: event.height,
         block_hash_hex: event.block_hash_hex,
-        wallet_address: hex::encode(event.wallet_address),
-        finder_pubkey: hex::encode(event.finder_pubkey),
-        reward_recipient: hex::encode(event.reward_recipient),
+        wallet_address: hex_encode(event.wallet_address),
+        finder_pubkey: hex_encode(event.finder_pubkey),
+        reward_recipient: hex_encode(event.reward_recipient),
         amount: format_hpn_128(event.amount_atomic),
         amount_atomic: event.amount_atomic.to_string(),
         mode: event.mode,
@@ -225,7 +226,7 @@ async fn pool_info(State(state): State<PoolApiState>) -> impl IntoResponse {
         Json(PoolInfoResponse {
             mode,
             pool_fee_bps: state.accounting.pool_fee_bps(),
-            pool_wallet: hex::encode(state.accounting.pool_wallet()),
+            pool_wallet: hex_encode(state.accounting.pool_wallet()),
             direct_coinbase: mode.uses_direct_coinbase(),
         }),
     )

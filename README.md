@@ -1,34 +1,55 @@
 # Hyphen Pool
 
-[中文](README_CN.md)
+Hyphen Pool is the independent mining-pool server for Hyphen block version 5
+(PoUW v3). It connects to the node's template protocol, serves signed Protocol v6
+jobs to miners, verifies single-use Cunningham witness chains itself, keeps
+durable accounting, and drives payouts through Hyphen Wallet's payout agent.
 
-Hyphen Pool is the independent scientific-work pool server for Hyphen block version 3. It connects to node template protocol v3, serves signed Pool Protocol v5 jobs, independently recomputes scientific checkpoints and full block work, maintains durable accounting, and coordinates payouts through Hyphen Wallet's payout agent.
+Consensus types, hashing, the wire profile, and the node protocol are not copied
+here. `hyphen-core`, `hyphen-crypto`, `hyphen-pow`, and `hyphen-transport` are
+path dependencies, and the pool derives the chain identity from its configuration
+instead of pinning literals.
 
-## Scientific-work verification
+## Share semantics
 
-Pool v5 does not accept low hashes. For each miner submission the pool reconstructs the miner-bound header and recomputes the deterministic 64x64 Q12 diffusion PDE.
+A share is a witness list, not a nonce. For every submission the pool:
 
-- A checkpoint uses fewer iterations than the block requirement and carries no block authorization.
-- A full result uses exactly the block difficulty, updates pow_commitment, and must include a miner signature binding the complete header and reward keys.
-- The pool submits a block only after commitment, authorization, chain identity, job freshness, and transaction binding all pass.
-- Legacy Stratum cannot carry these commitments and frozen-v3 authorization, so it is rejected for PoUW submissions.
+1. Rejects a chain length that differs from the job's.
+2. Rejects any witness already claimed on this pool.
+3. Runs the node's own predicate (`verify_witnesses`) over the list.
+4. Recomputes `witness_commitment(parent_commitment, height, witnesses)` and
+   compares it with the commitment the miner submitted.
 
-BLAKE3 remains in message, receipt, transaction and commitment integrity paths. It is not used as the work acceptance target.
+A list of `difficulty` witnesses is a block candidate: the pool reconstructs the
+exact header the miner signed, verifies the miner authorization inside it,
+assembles the block with `pow_witnesses`, and submits it. A shorter list with at
+least `share_difficulty` witnesses earns credit.
 
-The protocol identifier is PoUW v1, but checkpoints prove only the specified deterministic PDE. They are not proofs of a user-funded AetherCompute task, external scientific utility, or succinct verification. Pool compute-rate accounting uses seven specified arithmetic operations per cell update and caps every checkpoint at the consensus maximum of 4096 iterations.
+Credit is granted per witness the pool has not paid for before, so submitting a
+prefix and then the full list cannot be double counted, and a replayed list earns
+nothing. The node enforces single use chain-wide with its own sparse Merkle set;
+the pool mirrors the rule so a replay is refused before the node ever sees it.
 
-## Accounting
+`share_difficulty` is therefore a witness count, not an iteration count. The
+persisted ledger field keeps its old name for compatibility.
 
-SOLO, PROP, PPS, PPLNS, PPS+ and FPPS modes remain available. The persisted field name share_difficulty is retained for ledger compatibility, but in Pool v5 its value is a verified checkpoint iteration count.
+The pool also re-derives the credit threshold from the miner's reported compute
+rate and the analytic witness density `(1 / ln 2^63)^chain_length`, then clamps
+it to the job's own difficulty. Estimating beats guessing, and the job's
+difficulty always wins.
 
-For checkpoint iterations d, block iterations D, reward basis R, and fee b basis points:
+## Stratum
 
-```text
-gross = floor(R * d / D)
-net   = floor(gross * (10000 - b) / 10000)
-```
+The legacy Stratum V1 adapter was removed. Stratum submits a nonce and a hash;
+that cannot carry a witness list or a miner block authorization, so a Stratum
+miner can never produce a block on this chain. Keeping the adapter would have
+been a compatibility claim the code could not honor.
 
-The pool signs a chained receipt over the miner, sequence, previous receipt, submission commitment and result. This provides tamper evidence, not proof of solvency or public data availability.
+## Payout modes
+
+SOLO, PROP, PPS, PPLNS, PPS+ and FPPS remain available. For a submission with
+`k` credited witnesses against a block requirement of `D` and a reward basis of
+`R`, the credited amount is `R * k / D` before the pool fee.
 
 ## Build and run
 
@@ -36,37 +57,21 @@ The pool signs a chained receipt over the miner, sequence, previous receipt, sub
 cargo build --release --locked
 cargo test --locked
 cargo clippy --all-targets --locked -- -D warnings
-.\target\release\hyphen-pool-server.exe keygen --output .\pool.key
+
+.\target\release\hyphen-pool-server.exe --network devnet --node 127.0.0.1:3350 `
+    --bind 0.0.0.0:3340 --pool-state-dir pool_state
 ```
 
-SOLO devnet:
+## Protocol
 
-```powershell
-.\target\release\hyphen-pool-server.exe `
-  --network devnet `
-  --node 127.0.0.1:3350 `
-  --key-file .\pool.key `
-  --bind 127.0.0.1:3340 `
-  --api-bind 127.0.0.1:8081 `
-  --share-difficulty 32 `
-  --payout-mode solo `
-  --pool-state-dir .\pool_state
-```
+- Block version: 5
+- PoUW protocol: 3
+- Template protocol: 5 (node to pool)
+- Pool protocol: 6 (pool to miner)
 
-Shared payout modes additionally require a network-correct pool wallet, a loopback payout agent, an authentication token file, minimum payout and confirmation policy. Keep node RPC and payout services on a trusted host.
+## Limits
 
-## Compatibility
-
-- Node template protocol: 3
-- Pool protocol: 5
-- Block version: 3
-- PoUW protocol: 1
-- Fixed scientific vector: 25078c250c5b44211bbf0fea60e90ac7024df6ff94d154161852fdd72684e524
-
-Miner and pool reject mismatched consensus parameter hashes and genesis hashes. RustBinary uses bounded fixed-width little-endian encoding and rejects trailing bytes. Existing accounting ledgers use an explicit versioned migration and refuse unreadable state instead of silently replacing it.
-
-The pool is not trustless. It can omit transactions before creating a job, refuse service, and control a shared reward wallet. This software has not received an independent economic, consensus or payout audit.
-
-## License
-
-Hyphen Pool is licensed under the PolyForm Strict License 1.0.0. See [LICENSE](LICENSE).
+Not independently audited. Chain-wide single use is enforced by the node; the
+pool's claim set is a stricter local view that protects its own ledger. If a
+block is rejected after the pool credited it, the pool stays stricter than the
+chain, which costs liveness, never soundness.

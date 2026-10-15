@@ -10,22 +10,22 @@ use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
 use crate::accounting::PoolAccounting;
-use crate::pow::EpochArena;
 use crate::primitives::{
-    blake3_hash, Block, BlockAuthorization, ChainConfig, Hash256, SecretKey, FROZEN_BLOCK_VERSION,
+    blake3_hash, Block, BlockAuthorization, ChainConfig, SecretKey, FROZEN_BLOCK_VERSION,
 };
 use crate::tp::{BlockTemplate, TemplateProvider, TP_TEMPLATE};
 
 use crate::job::{ActiveJob, JobManager};
+use crate::primitives::{hex_encode, ChainIdentity};
 use crate::protocol::*;
-use crate::share::{verify_share, ShareVerdict};
+use crate::share::{verify_share, ClaimedWitnesses, ShareVerdict};
 
 /// Target seconds between shares per miner
 const VARDIFF_TARGET_SECS: f64 = 15.0;
 /// Minimum share difficulty
 const VARDIFF_MIN: u64 = 10;
 /// A checkpoint can never exceed the consensus iteration ceiling.
-const VARDIFF_MAX: u64 = crate::pow::MAX_POUW_ITERATIONS;
+const VARDIFF_MAX: u64 = hyphen_pow::vms::MAX_WITNESSES_PER_BLOCK;
 /// Number of shares to look back for rate calculation
 const VARDIFF_WINDOW: usize = 24;
 /// Retarget check interval (after this many shares)
@@ -124,7 +124,7 @@ impl VarDiffState {
 
     /// Record a share and return Some(new_diff) if adjustment is needed.
     fn record_share(&mut self) -> Option<u64> {
-        let now_ms = chrono::Utc::now().timestamp_millis() as u64;
+        let now_ms = hyphen_core::timestamp::ntp_adjusted_timestamp_ms();
         self.share_timestamps.push_back(now_ms);
         if self.share_timestamps.len() > VARDIFF_WINDOW {
             self.share_timestamps.pop_front();
@@ -175,8 +175,6 @@ impl VarDiffState {
     }
 }
 
-type ArenaCache = Option<(Hash256, Arc<EpochArena>)>;
-
 #[derive(Clone, Debug)]
 enum PoolBroadcast {
     NewTemplate,
@@ -193,32 +191,37 @@ pub struct PoolServer<T: TemplateProvider + Send + Sync + 'static> {
     bind_addr: SocketAddr,
     job_tx: broadcast::Sender<PoolBroadcast>,
     miners: Arc<RwLock<HashMap<[u8; 32], MinerSession>>>,
-    arena: Arc<RwLock<ArenaCache>>,
+    /// Witnesses already paid for on this pool. The node enforces single use
+    /// chain-wide; mirroring it here stops a replayed list from being credited
+    /// twice before the node ever sees it.
+    claimed_witnesses: Arc<RwLock<ClaimedWitnesses>>,
     /// GTM: per-IP connection counts for rate limiting
     ip_connections: Arc<RwLock<HashMap<std::net::IpAddr, usize>>>,
 }
 
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-pub struct ArenaParamsData {
-    pub arena_size: u64,
-    pub page_size: u64,
-}
-
 impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
-    fn recommended_share_difficulty(operations_per_second: u64, thread_count: u32) -> u64 {
-        const OPERATIONS_PER_ITERATION: f64 = (crate::pow::POUW_CELL_COUNT as u64
-            * crate::pow::POUW_ARITHMETIC_OPERATIONS_PER_CELL)
-            as f64;
-        if operations_per_second > 0 {
-            (operations_per_second as f64 * VARDIFF_TARGET_SECS / OPERATIONS_PER_ITERATION)
-                .round()
-                .max(VARDIFF_MIN as f64)
-                .min(VARDIFF_MAX as f64) as u64
-        } else if thread_count > 0 {
-            (thread_count as u64 * VARDIFF_INITIAL).clamp(VARDIFF_MIN, VARDIFF_MAX)
-        } else {
-            VARDIFF_INITIAL
+    /// Witness count that should arrive roughly every `VARDIFF_TARGET_SECS`.
+    ///
+    /// Witness density is analytic rather than empirical: a chain of length `L`
+    /// needs `L` primes, and a random 64-bit origin is prime with probability
+    /// about `1 / ln(2^63)`. Estimating beats guessing, and the value is capped
+    /// against the job's own difficulty before it is ever enforced.
+    fn recommended_share_difficulty(
+        cfg: &ChainConfig,
+        operations_per_second: u64,
+        thread_count: u32,
+    ) -> u64 {
+        if operations_per_second == 0 {
+            return if thread_count > 0 {
+                (thread_count as u64 * VARDIFF_INITIAL).clamp(VARDIFF_MIN, VARDIFF_MAX)
+            } else {
+                VARDIFF_INITIAL
+            };
         }
+        let length = cfg.pouw_chain_length.max(1) as f64;
+        let witness_probability = (1.0 / 43.7_f64).powf(length);
+        let expected = operations_per_second as f64 * witness_probability * VARDIFF_TARGET_SECS;
+        (expected.round() as u64).clamp(1, VARDIFF_MAX)
     }
 
     pub fn new(
@@ -241,27 +244,9 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
             bind_addr,
             job_tx,
             miners: Arc::new(RwLock::new(HashMap::new())),
-            arena: Arc::new(RwLock::new(None)),
+            claimed_witnesses: Arc::new(RwLock::new(ClaimedWitnesses::default())),
             ip_connections: Arc::new(RwLock::new(HashMap::new())),
         }
-    }
-
-    fn get_arena(&self, epoch_seed: Hash256) -> Arc<EpochArena> {
-        {
-            let guard = self.arena.read();
-            if let Some((seed, ref a)) = *guard {
-                if seed == epoch_seed {
-                    return Arc::clone(a);
-                }
-            }
-        }
-        let new_arena = Arc::new(EpochArena::generate(
-            epoch_seed,
-            self.cfg.arena_size,
-            self.cfg.page_size,
-        ));
-        *self.arena.write() = Some((epoch_seed, Arc::clone(&new_arena)));
-        new_arena
     }
 
     fn session_wallet(&self, miner_pk: &[u8; 32]) -> [u8; 32] {
@@ -342,12 +327,7 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
         let header_data = crate::wire_config(crate::DEFAULT_WIRE_BYTES)
             .serialize(&header)
             .expect("header serialisation");
-        let arena_params = crate::wire_config(crate::DEFAULT_WIRE_BYTES)
-            .serialize(&ArenaParamsData {
-                arena_size: job.arena_size as u64,
-                page_size: job.page_size as u64,
-            })
-            .expect("arena params serialisation");
+        let identity = ChainIdentity::of(&self.cfg);
 
         JobTemplate {
             job_id: job.job_id.to_vec(),
@@ -357,13 +337,14 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
             share_difficulty,
             epoch_seed: job.epoch_seed.as_bytes().to_vec(),
             prev_hash: header.prev_hash.as_bytes().to_vec(),
-            arena_params,
+            chain_length: job.chain_length as u64,
             clean_jobs,
-            consensus_params_hash: self.cfg.consensus_params_hash().to_vec(),
-            genesis_hash: self.cfg.genesis_hash().to_vec(),
+            consensus_params_hash: identity.consensus_params_hash.to_vec(),
+            genesis_hash: identity.genesis_hash.as_bytes().to_vec(),
             reward_view_public: reward_view_public.to_vec(),
             reward_spend_public: reward_spend_public.to_vec(),
             transactions: job.transactions.clone(),
+            parent_work_commitment: job.parent_work_commitment.as_bytes().to_vec(),
         }
     }
 
@@ -488,15 +469,17 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
     }
 
     fn apply_template(&self, tpl: &BlockTemplate) {
-        if tpl.protocol_version != 3
+        // The template protocol version is the node's, which is a different
+        // contract from the miner-facing protocol version in `crate::protocol`.
+        if tpl.protocol_version != hyphen_transport::POOL_PROTOCOL_VERSION
             || tpl.network_magic.as_slice() != self.cfg.network_magic
             || tpl.consensus_params_hash.as_slice() != self.cfg.consensus_params_hash()
-            || tpl.genesis_hash.as_slice() != self.cfg.genesis_hash()
+            || tpl.genesis_hash.as_slice() != ChainIdentity::of(&self.cfg).genesis_hash.as_bytes()
         {
             warn!(
                 "Rejected template for wrong chain/protocol: version={}, magic={}",
                 tpl.protocol_version,
-                hex::encode(&tpl.network_magic),
+                hex_encode(&tpl.network_magic),
             );
             return;
         }
@@ -504,8 +487,8 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
             || tpl.epoch_seed.len() != 32
             || tpl.prev_hash.len() != 32
             || tpl.difficulty == 0
-            || tpl.arena_size != self.cfg.arena_size as u64
-            || tpl.page_size != self.cfg.page_size as u64
+            || tpl.pouw_chain_length != self.cfg.pouw_chain_length as u64
+            || tpl.parent_work_commitment.len() != 32
         {
             warn!("Rejected malformed or incompatible node template");
             return;
@@ -551,7 +534,7 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
         if login.protocol_version != POOL_PROTOCOL_VERSION
             || login.network_magic.as_slice() != self.cfg.network_magic
             || login.consensus_params_hash.as_slice() != self.cfg.consensus_params_hash()
-            || login.genesis_hash.as_slice() != self.cfg.genesis_hash()
+            || login.genesis_hash.as_slice() != ChainIdentity::of(&self.cfg).genesis_hash.as_bytes()
         {
             let ack = LoginAck {
                 accepted: false,
@@ -569,7 +552,10 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                 network_magic: self.cfg.network_magic.to_vec(),
                 protocol_version: POOL_PROTOCOL_VERSION,
                 consensus_params_hash: self.cfg.consensus_params_hash().to_vec(),
-                genesis_hash: self.cfg.genesis_hash().to_vec(),
+                genesis_hash: ChainIdentity::of(&self.cfg)
+                    .genesis_hash
+                    .as_bytes()
+                    .to_vec(),
             };
             let envelope = PoolEnvelope::sign(MSG_LOGIN_ACK, ack.encode_to_vec(), &self.pool_key);
             PoolCodec::write_envelope(&mut stream, &envelope).await?;
@@ -602,12 +588,13 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
             "Miner authenticated: id={}, addr={}, pk={}, wallet={}, threads={}",
             login.miner_id,
             addr,
-            hex::encode(miner_pk),
-            hex::encode(wallet_addr),
+            hex_encode(miner_pk),
+            hex_encode(wallet_addr),
             login.thread_count,
         );
 
         let initial_diff = Self::recommended_share_difficulty(
+            &self.cfg,
             login.estimated_operations_per_second,
             login.thread_count,
         );
@@ -663,7 +650,10 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
             network_magic: self.cfg.network_magic.to_vec(),
             protocol_version: POOL_PROTOCOL_VERSION,
             consensus_params_hash: self.cfg.consensus_params_hash().to_vec(),
-            genesis_hash: self.cfg.genesis_hash().to_vec(),
+            genesis_hash: ChainIdentity::of(&self.cfg)
+                .genesis_hash
+                .as_bytes()
+                .to_vec(),
         };
         let ack_env = PoolEnvelope::sign(MSG_LOGIN_ACK, ack.encode_to_vec(), &self.pool_key);
         PoolCodec::write_envelope(&mut stream, &ack_env).await?;
@@ -750,7 +740,7 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                                 if let Some(diff) = new_diff {
                                     info!(
                                         "VarDiff: miner {} → share_diff={}",
-                                        hex::encode(miner_pk),
+                                        hex_encode(miner_pk),
                                         diff
                                     );
                                     let set_msg = SetDifficulty {
@@ -791,7 +781,7 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                             if let Ok(report) = ComputeRateReport::decode(&env.payload[..]) {
                                 info!(
                                     "Scientific compute report from {}: {} ops/s, total={}, uptime={}s",
-                                    hex::encode(miner_pk),
+                                    hex_encode(miner_pk),
                                     report.operations_per_second,
                                     report.total_operations,
                                     report.uptime_secs,
@@ -800,7 +790,7 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                                 let new_diff = {
                                     let mut miners = self.miners.write();
                                     miners.get_mut(&miner_pk).and_then(|session| {
-                                        let recommended = Self::recommended_share_difficulty(
+                                        let recommended = Self::recommended_share_difficulty(&self.cfg,
                                             report.operations_per_second,
                                             session.thread_count,
                                         );
@@ -830,7 +820,7 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                                 if let Some(diff) = new_diff {
                                     info!(
                                         "Checkpoint update: miner {} -> iterations={} (compute={} ops/s)",
-                                        hex::encode(miner_pk),
+                                        hex_encode(miner_pk),
                                         diff,
                                         report.operations_per_second,
                                     );
@@ -911,8 +901,8 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                 self.accounting.note_disconnect(miner_pk);
                 info!(
                     "Miner disconnected: pk={}, wallet={}, shares={}, invalid={}",
-                    hex::encode(miner_pk),
-                    hex::encode(session.wallet_address),
+                    hex_encode(miner_pk),
+                    hex_encode(session.wallet_address),
                     session.shares,
                     session.invalid_shares
                 );
@@ -983,12 +973,6 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
             };
         }
 
-        let mut extra_nonce = [0u8; 32];
-        if submission.extra_nonce.len() == 32 {
-            extra_nonce.copy_from_slice(&submission.extra_nonce);
-        }
-
-        let arena = self.get_arena(job.epoch_seed);
         let wallet_address = self.session_wallet(miner_pk);
         let reward_recipient = self.accounting.reward_recipient_for_wallet(wallet_address);
         let mut effective_header = job.header.clone();
@@ -1017,24 +1001,45 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
             }
         };
 
-        let effective_share_diff = effective_share_diff.clamp(1, effective_header.difficulty);
-        let verification_iterations = if submission.block_authorization.is_empty() {
-            effective_share_diff
-        } else {
-            effective_header.difficulty
-        };
+        let credit_at = effective_share_diff.clamp(1, effective_header.difficulty);
+        if submission.chain_length != job.chain_length as u64 {
+            return SubmitResult {
+                accepted: false,
+                error: format!(
+                    "submission claims chain length {} but the job requires {}",
+                    submission.chain_length, job.chain_length
+                ),
+                block_found: false,
+                block_hash: Vec::new(),
+            };
+        }
+        {
+            let claimed = self.claimed_witnesses.read();
+            if let Some(duplicate) = submission
+                .witnesses
+                .iter()
+                .find(|witness| claimed.contains(**witness))
+            {
+                return SubmitResult {
+                    accepted: false,
+                    error: format!("witness {duplicate} was already claimed on this pool"),
+                    block_found: false,
+                    block_hash: Vec::new(),
+                };
+            }
+        }
         let verdict = verify_share(
             &effective_header,
-            submission.nonce,
-            &extra_nonce,
-            &arena,
-            &self.cfg,
-            verification_iterations,
+            job.chain_length,
+            &job.parent_work_commitment,
+            &submission.witnesses,
+            effective_header.difficulty,
+            credit_at,
         );
 
         match verdict {
-            ShareVerdict::BlockFound { hash } => {
-                if submission.work_commitment.as_slice() != hash.as_bytes() {
+            ShareVerdict::BlockFound { commitment } => {
+                if submission.work_commitment.as_slice() != commitment.as_bytes() {
                     return SubmitResult {
                         accepted: false,
                         error: "submitted scientific-work commitment does not match recomputation"
@@ -1072,13 +1077,16 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                 }
 
                 let mut authorized_header = effective_header.clone();
-                authorized_header.nonce = submission.nonce;
-                authorized_header.extra_nonce = extra_nonce;
-                authorized_header.pow_commitment = hash;
-                if let Err(error) = authorization.verify(&authorized_header, &self.cfg) {
+                authorized_header.pow_commitment = commitment;
+                if let Err(error) = authorization.verify(
+                    &authorized_header,
+                    self.cfg.network_magic,
+                    self.cfg.consensus_params_hash(),
+                    ChainIdentity::of(&self.cfg).genesis_hash,
+                ) {
                     return SubmitResult {
                         accepted: false,
-                        error,
+                        error: error.to_string(),
                         block_found: false,
                         block_hash: Vec::new(),
                     };
@@ -1092,37 +1100,36 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                         block_hash: Vec::new(),
                     };
                 }
+                self.claimed_witnesses.write().claim(&submission.witnesses);
 
                 let wallet_hex = {
                     let miners = self.miners.read();
                     miners
                         .get(miner_pk)
-                        .map(|s| hex::encode(s.wallet_address))
+                        .map(|s| hex_encode(s.wallet_address))
                         .unwrap_or_default()
                 };
                 info!(
-                    "BLOCK FOUND by {} (wallet={}) at height {} hash={}",
-                    hex::encode(miner_pk),
+                    "BLOCK FOUND by {} (wallet={}) at height {} work_commitment={}",
+                    hex_encode(miner_pk),
                     wallet_hex,
                     effective_header.height,
-                    hash
+                    commitment
                 );
 
-                if effective_share_diff == effective_header.difficulty {
+                if credit_at == effective_header.difficulty {
                     self.accounting.record_valid_share(
                         *miner_pk,
                         wallet_address,
-                        effective_share_diff,
+                        credit_at,
                         effective_header.difficulty,
                         effective_header.reward,
                         effective_header.total_fee,
                     );
                 }
 
-                let mut mined_header = effective_header.clone();
-                mined_header.nonce = submission.nonce;
-                mined_header.extra_nonce = extra_nonce;
-                mined_header.pow_commitment = hash;
+                // The miner signed this exact header, so it is the block header.
+                let mined_header = authorized_header;
                 let block_height = mined_header.height;
                 let block_reward = mined_header.reward;
                 let block_total_fee = mined_header.total_fee;
@@ -1130,12 +1137,14 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
 
                 let block = Block {
                     header: mined_header,
+                    pow_witnesses: submission.witnesses.clone(),
                     transactions: job.transactions.clone(),
                     uncle_headers: Vec::new(),
                     block_authorization: submission.block_authorization.clone(),
                 };
 
                 let block_hash = block.hash();
+                info!("Submitting block {} to the node", block_hash);
 
                 let block_data = match crate::wire_config(8 * 1024 * 1024).serialize(&block) {
                     Ok(data) => data,
@@ -1216,21 +1225,28 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                 }
             }
 
-            ShareVerdict::ValidShare { hash } => {
-                if submission.work_commitment.as_slice() != hash.as_bytes()
+            ShareVerdict::Credit => {
+                if submission.work_commitment.as_slice()
+                    != hyphen_pow::vms::witness_commitment(
+                        &job.parent_work_commitment,
+                        effective_header.height,
+                        &submission.witnesses,
+                    )
+                    .as_bytes()
                     || !submission.block_authorization.is_empty()
                 {
                     return SubmitResult {
                         accepted: false,
-                        error: "scientific checkpoint commitment mismatch".into(),
+                        error: "witness commitment mismatch".into(),
                         block_found: false,
                         block_hash: Vec::new(),
                     };
                 }
+                let credited = self.claimed_witnesses.write().claim(&submission.witnesses);
                 self.accounting.record_valid_share(
                     *miner_pk,
                     wallet_address,
-                    effective_share_diff,
+                    credited.max(1),
                     effective_header.difficulty,
                     effective_header.reward,
                     effective_header.total_fee,

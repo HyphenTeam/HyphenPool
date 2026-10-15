@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use crate::primitives::{base58, blake3_hash, hex_decode, hex_encode};
 use clap::ValueEnum;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -379,8 +380,7 @@ impl PoolAccounting {
         network_magic: [u8; 4],
     ) -> Result<([u8; 32], [u8; 32]), String> {
         if let Some(encoded) = input.strip_prefix("hy1") {
-            let payload = bs58::decode(encoded)
-                .into_vec()
+            let payload = base58::decode(encoded)
                 .map_err(|error| format!("invalid hy1 address base58: {error}"))?;
             if payload.len() != 69 {
                 return Err(format!(
@@ -388,7 +388,7 @@ impl PoolAccounting {
                     payload.len()
                 ));
             }
-            let checksum = blake3::hash(&payload[..65]);
+            let checksum = blake3_hash(&payload[..65]);
             if checksum.as_bytes()[..4] != payload[65..69] {
                 return Err("hy1 address checksum mismatch".into());
             }
@@ -462,7 +462,7 @@ impl PoolAccounting {
             .unwrap_or([0u8; 32]);
         {
             let mut state = self.state.write();
-            let ledger = state.miners.entry(hex::encode(miner_pubkey)).or_default();
+            let ledger = state.miners.entry(hex_encode(miner_pubkey)).or_default();
             ledger.wallet_address = wallet_address;
             ledger.wallet_view_public = wallet_view_public;
             ledger.last_share_timestamp.get_or_insert(now);
@@ -484,7 +484,7 @@ impl PoolAccounting {
 
         {
             let mut state = self.state.write();
-            let miner_key = hex::encode(miner_pubkey);
+            let miner_key = hex_encode(miner_pubkey);
             let mode = state.mode;
             let pool_fee_bps = state.pool_fee_bps;
             let pplns_window_factor = state.pplns_window_factor;
@@ -566,7 +566,7 @@ impl PoolAccounting {
     pub fn record_invalid_share(&self, miner_pubkey: [u8; 32]) {
         {
             let mut state = self.state.write();
-            let ledger = state.miners.entry(hex::encode(miner_pubkey)).or_default();
+            let ledger = state.miners.entry(hex_encode(miner_pubkey)).or_default();
             ledger.invalid_shares = ledger.invalid_shares.saturating_add(1);
         }
         self.save_if_needed(false);
@@ -575,7 +575,7 @@ impl PoolAccounting {
     pub fn note_disconnect(&self, miner_pubkey: [u8; 32]) {
         {
             let mut state = self.state.write();
-            if let Some(ledger) = state.miners.get_mut(&hex::encode(miner_pubkey)) {
+            if let Some(ledger) = state.miners.get_mut(&hex_encode(miner_pubkey)) {
                 ledger.last_disconnect_timestamp = Some(now_secs());
             }
         }
@@ -586,7 +586,7 @@ impl PoolAccounting {
         self.state
             .read()
             .miners
-            .get(&hex::encode(miner_pubkey))
+            .get(&hex_encode(miner_pubkey))
             .cloned()
     }
 
@@ -797,7 +797,7 @@ impl PoolAccounting {
         let next_sequence = sequence.checked_add(1).ok_or_else(|| {
             AccountingError::InvalidPayoutTransition("payout sequence exhausted".into())
         })?;
-        let intent_hash = blake3::hash(
+        let intent_hash = blake3_hash(
             &[
                 b"Hyphen/Pool/PayoutIntent/v1".as_slice(),
                 self.network_magic.as_slice(),
@@ -810,7 +810,7 @@ impl PoolAccounting {
             .concat(),
         );
         let record = PayoutRecord {
-            intent_id: hex::encode(intent_hash.as_bytes()),
+            intent_id: hex_encode(intent_hash.as_bytes()),
             recipient_view_public: view_public,
             recipient_spend_public: spend_public,
             amount_atomic,
@@ -993,7 +993,7 @@ impl PoolAccounting {
             }
             let gross_block_reward = block_reward_atomic as u128;
             let gross_total = gross_block_reward + total_fee_atomic as u128;
-            let finder_key = hex::encode(finder_pubkey);
+            let finder_key = hex_encode(finder_pubkey);
             let mode = state.mode;
             let pool_fee_bps = state.pool_fee_bps;
             let pplns_window_factor = state.pplns_window_factor;
@@ -1014,7 +1014,7 @@ impl PoolAccounting {
 
             let (distributed_atomic, pool_fee_atomic, reward_events) = match mode {
                 PoolMode::Solo => {
-                    if let Some(finder) = state.miners.get_mut(&hex::encode(finder_pubkey)) {
+                    if let Some(finder) = state.miners.get_mut(&hex_encode(finder_pubkey)) {
                         finder.direct_reward_atomic =
                             finder.direct_reward_atomic.saturating_add(gross_total);
                     }
@@ -1153,7 +1153,7 @@ impl PoolAccounting {
         let mut allocated = 0u128;
 
         for share in shares {
-            let miner_key = hex::encode(share.miner_pubkey);
+            let miner_key = hex_encode(share.miner_pubkey);
             let amount = distributable.saturating_mul(share.difficulty as u128) / total_weight;
             allocated = allocated.saturating_add(amount);
             *allocations.entry(miner_key).or_insert(0) += amount;
@@ -1164,7 +1164,7 @@ impl PoolAccounting {
         if remainder > 0 {
             if let Some(top_share) = shares.iter().max_by_key(|share| share.difficulty) {
                 *allocations
-                    .entry(hex::encode(top_share.miner_pubkey))
+                    .entry(hex_encode(top_share.miner_pubkey))
                     .or_insert(0) += remainder;
                 *wallet_allocations
                     .entry(top_share.wallet_address)
@@ -1342,7 +1342,7 @@ fn persistence_sidecar(path: &Path, suffix: &str) -> PathBuf {
 }
 
 fn validate_hash_hex(value: &str, name: &str) -> Result<(), AccountingError> {
-    let bytes = hex::decode(value).map_err(|_| {
+    let bytes = hex_decode(value).map_err(|_| {
         AccountingError::InvalidPayoutTransition(format!("{name} must be hexadecimal"))
     })?;
     if bytes.len() != 32 {
@@ -1370,9 +1370,9 @@ fn encode_wallet_address(
     payload.push(version);
     payload.extend_from_slice(&view_public);
     payload.extend_from_slice(&spend_public);
-    let checksum = blake3::hash(&payload);
+    let checksum = blake3_hash(&payload);
     payload.extend_from_slice(&checksum.as_bytes()[..4]);
-    Ok(format!("hy1{}", bs58::encode(payload).into_string()))
+    Ok(format!("hy1{}", base58::encode(&payload)))
 }
 
 fn proportional_credit(share_difficulty: u64, block_difficulty: u64, amount: u128) -> u128 {
@@ -1387,7 +1387,7 @@ fn apply_fee(amount: u128, pool_fee_bps: u16) -> u128 {
 }
 
 fn now_secs() -> u64 {
-    chrono::Utc::now().timestamp().max(0) as u64
+    hyphen_core::timestamp::ntp_adjusted_timestamp_secs()
 }
 
 fn max_option(left: Option<u64>, right: Option<u64>) -> Option<u64> {
@@ -1444,9 +1444,9 @@ mod tests {
         let mut payload = vec![0x01];
         payload.extend_from_slice(&[7u8; 32]);
         payload.extend_from_slice(&[8u8; 32]);
-        let checksum = blake3::hash(&payload);
+        let checksum = blake3_hash(&payload);
         payload.extend_from_slice(&checksum.as_bytes()[..4]);
-        let address = format!("hy1{}", bs58::encode(payload).into_string());
+        let address = format!("hy1{}", base58::encode(&payload));
 
         let error =
             PoolAccounting::parse_wallet_input(&address, [0x48, 0x59, 0x54, 0x53]).unwrap_err();
@@ -1458,9 +1458,9 @@ mod tests {
         let mut payload = vec![0x02];
         payload.extend_from_slice(&[7u8; 32]);
         payload.extend_from_slice(&[8u8; 32]);
-        let checksum = blake3::hash(&payload);
+        let checksum = blake3_hash(&payload);
         payload.extend_from_slice(&checksum.as_bytes()[..4]);
-        let address = format!("hy1{}", bs58::encode(payload).into_string());
+        let address = format!("hy1{}", base58::encode(&payload));
 
         let (view_public, spend_public) =
             PoolAccounting::parse_wallet_input(&address, [0x48, 0x59, 0x44, 0x56]).unwrap();
@@ -1473,7 +1473,7 @@ mod tests {
         let test_dir = std::env::temp_dir().join(format!(
             "hyphen_pool_fault_injection_{}_{}",
             std::process::id(),
-            rand::random::<u64>()
+            crate::random_u64()
         ));
         let mut config = sample_config();
         config.state_dir = Some(test_dir.clone());
@@ -1502,7 +1502,7 @@ mod tests {
         let test_dir = std::env::temp_dir().join(format!(
             "hyphen_pool_fail_closed_{}_{}",
             std::process::id(),
-            rand::random::<u64>()
+            crate::random_u64()
         ));
         std::fs::create_dir_all(&test_dir).unwrap();
         let primary = test_dir.join("pool_accounting.bin");
@@ -1584,7 +1584,7 @@ mod tests {
         let test_dir = std::env::temp_dir().join(format!(
             "hyphen_pool_payout_test_{}_{}",
             std::process::id(),
-            rand::random::<u64>()
+            crate::random_u64()
         ));
         let mut config = sample_config();
         config.mode = PoolMode::Pps;
@@ -1657,13 +1657,13 @@ mod tests {
         let test_dir = std::env::temp_dir().join(format!(
             "hyphen_pool_legacy_test_{}_{}",
             std::process::id(),
-            rand::random::<u64>()
+            crate::random_u64()
         ));
         std::fs::create_dir_all(&test_dir).unwrap();
         let miner = [21u8; 32];
         let mut miners = HashMap::new();
         miners.insert(
-            hex::encode(miner),
+            hex_encode(miner),
             LegacyMinerLedgerV0 {
                 wallet_address: [22u8; 32],
                 valid_shares: 3,

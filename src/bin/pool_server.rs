@@ -9,9 +9,8 @@ use hyphen_pool::accounting::{PoolAccounting, PoolAccountingConfig, PoolMode};
 use hyphen_pool::api::start_pool_api;
 use hyphen_pool::job::JobManager;
 use hyphen_pool::payout::{load_token_file, PayoutAgentClient, PayoutWorker, PayoutWorkerConfig};
-use hyphen_pool::primitives::{ChainConfig, SecretKey};
+use hyphen_pool::primitives::{hex_encode, ChainConfig, SecretKey};
 use hyphen_pool::server::PoolServer;
-use hyphen_pool::stratum::StratumServer;
 use hyphen_pool::template::TemplateProviderClient;
 use hyphen_pool::tp::TemplateProvider;
 
@@ -31,10 +30,6 @@ struct Cli {
     /// Pool protocol listen address (protobuf miners)
     #[arg(long, default_value = "0.0.0.0:3340")]
     bind: String,
-
-    /// Stratum V1 listen address (JSON-RPC miners)
-    #[arg(long, default_value = "0.0.0.0:3333")]
-    stratum_bind: String,
 
     /// HTTP listen address for pool accounting API
     #[arg(long, default_value = "0.0.0.0:8081")]
@@ -67,11 +62,6 @@ struct Cli {
     /// Data directory for pool accounting persistence
     #[arg(long, default_value = "pool_state")]
     pool_state_dir: String,
-
-    /// Enable the legacy share-only Stratum V1 test adapter. It cannot submit
-    /// frozen-v2 blocks and is forbidden on mainnet.
-    #[arg(long)]
-    enable_legacy_stratum: bool,
 
     /// Disable pool accounting HTTP API
     #[arg(long)]
@@ -178,9 +168,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if cli.key_file.is_empty() || cli.pool_wallet.is_empty() {
             return Err("mainnet pools require both --key-file and --pool-wallet".into());
         }
-        if cli.enable_legacy_stratum {
-            return Err("legacy Stratum is disabled on mainnet because it cannot carry miner block authorization".into());
-        }
     }
     if cli.payout_mode != PoolMode::Solo
         && (cli.payout_agent.is_empty() || cli.payout_token_file.is_empty())
@@ -216,11 +203,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .parse()
         .map_err(|e| format!("invalid bind address: {e}"))?;
 
-    let stratum_addr: SocketAddr = cli
-        .stratum_bind
-        .parse()
-        .map_err(|e| format!("invalid stratum bind address: {e}"))?;
-
     let api_addr: SocketAddr = cli
         .api_bind
         .parse()
@@ -234,7 +216,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pool_fee_bps = cli
         .pool_fee_bps
         .unwrap_or_else(|| cli.payout_mode.default_fee_bps());
-    info!("Pool reward wallet: {}", hex::encode(pool_pubkey));
+    info!("Pool reward wallet: {}", hex_encode(pool_pubkey));
     info!(
         "Pool payout mode: mode={}, fee_bps={}, pplns_window_factor={}",
         cli.payout_mode, pool_fee_bps, cli.pplns_window_factor,
@@ -254,17 +236,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         pool_pubkey,
     ));
 
-    run_with_node(
-        cli,
-        cfg,
-        sk,
-        bind_addr,
-        stratum_addr,
-        api_addr,
-        job_manager,
-        accounting,
-    )
-    .await
+    run_with_node(cli, cfg, sk, bind_addr, api_addr, job_manager, accounting).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -273,7 +245,6 @@ async fn run_with_node(
     cfg: ChainConfig,
     sk: SecretKey,
     bind_addr: SocketAddr,
-    stratum_addr: SocketAddr,
     api_addr: SocketAddr,
     job_manager: Arc<JobManager>,
     accounting: Arc<PoolAccounting>,
@@ -288,12 +259,11 @@ async fn run_with_node(
 
     info!("Connected to node Template Provider");
 
-    start_pool_and_stratum(
+    start_pool(
         cli,
         cfg,
         sk,
         bind_addr,
-        stratum_addr,
         api_addr,
         job_manager,
         accounting,
@@ -303,12 +273,11 @@ async fn run_with_node(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn start_pool_and_stratum<T: TemplateProvider + Send + Sync + 'static>(
+async fn start_pool<T: TemplateProvider + Send + Sync + 'static>(
     cli: Cli,
     cfg: ChainConfig,
     sk: SecretKey,
     bind_addr: SocketAddr,
-    stratum_addr: SocketAddr,
     api_addr: SocketAddr,
     job_manager: Arc<JobManager>,
     accounting: Arc<PoolAccounting>,
@@ -358,19 +327,6 @@ async fn start_pool_and_stratum<T: TemplateProvider + Send + Sync + 'static>(
         tokio::spawn(async move { p.run().await })
     };
 
-    let stratum_handle = if cli.enable_legacy_stratum {
-        let stratum = Arc::new(StratumServer::new(
-            Arc::clone(&job_manager),
-            Arc::clone(&tp),
-            Arc::clone(&accounting),
-            cfg,
-            stratum_addr,
-        ));
-        Some(tokio::spawn(async move { stratum.run().await }))
-    } else {
-        None
-    };
-
     let api_handle = if !cli.no_api {
         info!("Pool API: bind={}", api_addr);
         let accounting = Arc::clone(&accounting);
@@ -382,9 +338,6 @@ async fn start_pool_and_stratum<T: TemplateProvider + Send + Sync + 'static>(
     };
 
     pool_handle.await??;
-    if let Some(h) = stratum_handle {
-        let _ = h.await?;
-    }
     if let Some(h) = api_handle {
         let _ = h.await?;
     }

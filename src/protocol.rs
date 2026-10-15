@@ -1,6 +1,6 @@
 use prost::Message;
 
-use crate::primitives::{blake3_hash_many, PublicKey, SecretKey, Signature};
+use crate::primitives::{blake3_hash_many, fill_system_random, PublicKey, SecretKey, Signature};
 
 const SHARE_RECEIPT_DOMAIN: &[u8] = b"Hyphen/NCAP/share-receipt/v1";
 
@@ -60,8 +60,10 @@ impl PoolEnvelope {
         receipt_hash: Vec<u8>,
     ) -> Self {
         let pk = sk.public_key();
-        let timestamp = chrono::Utc::now().timestamp() as u64;
-        let nonce: u64 = rand::random();
+        let timestamp = hyphen_core::timestamp::ntp_adjusted_timestamp_secs();
+        let mut nonce_bytes = [0u8; 8];
+        fill_system_random(&mut nonce_bytes);
+        let nonce = u64::from_le_bytes(nonce_bytes);
 
         let sign_data = Self::sign_payload(
             msg_type,
@@ -118,7 +120,7 @@ impl PoolEnvelope {
         pk.verify(&sign_data, &sig)
             .map_err(|_| PoolError::SignatureVerificationFailed)?;
 
-        let now = chrono::Utc::now().timestamp() as u64;
+        let now = hyphen_core::timestamp::ntp_adjusted_timestamp_secs();
         if self.timestamp > now.saturating_add(30) {
             return Err(PoolError::MessageFromFuture);
         }
@@ -163,7 +165,10 @@ pub const MSG_BLOCK_FOUND: u32 = 7;
 pub const MSG_SET_DIFFICULTY: u32 = 8;
 pub const MSG_COMPUTE_RATE_REPORT: u32 = 9;
 pub const MSG_CHAIN_STATE: u32 = 10;
-pub const POOL_PROTOCOL_VERSION: u32 = 5;
+/// v6 replaces the nonce/extra-nonce search with single-use Cunningham witness
+/// chains: jobs carry the chain length and the parent work commitment, shares
+/// carry the witness list.
+pub const POOL_PROTOCOL_VERSION: u32 = 6;
 
 #[derive(Clone, prost::Message)]
 pub struct LoginRequest {
@@ -257,8 +262,9 @@ pub struct JobTemplate {
     pub epoch_seed: Vec<u8>,
     #[prost(bytes = "vec", tag = "7")]
     pub prev_hash: Vec<u8>,
-    #[prost(bytes = "vec", tag = "8")]
-    pub arena_params: Vec<u8>,
+    /// Cunningham chain length every witness must satisfy.
+    #[prost(uint64, tag = "8")]
+    pub chain_length: u64,
     #[prost(bool, tag = "9")]
     pub clean_jobs: bool,
     #[prost(bytes = "vec", tag = "10")]
@@ -271,16 +277,22 @@ pub struct JobTemplate {
     pub reward_spend_public: Vec<u8>,
     #[prost(bytes = "vec", repeated, tag = "14")]
     pub transactions: Vec<Vec<u8>>,
+    /// Work commitment of the parent block; the miner chains it with its
+    /// witness list to derive `pow_commitment`.
+    #[prost(bytes = "vec", tag = "15")]
+    pub parent_work_commitment: Vec<u8>,
 }
 
 #[derive(Clone, prost::Message)]
 pub struct ShareSubmission {
     #[prost(bytes = "vec", tag = "1")]
     pub job_id: Vec<u8>,
+    /// Chain length the witnesses satisfy; must equal the job's chain length.
     #[prost(uint64, tag = "2")]
-    pub nonce: u64,
-    #[prost(bytes = "vec", tag = "3")]
-    pub extra_nonce: Vec<u8>,
+    pub chain_length: u64,
+    /// Ascending, non-repeating Cunningham chain origins.
+    #[prost(uint64, repeated, tag = "3")]
+    pub witnesses: Vec<u64>,
     #[prost(bytes = "vec", tag = "4")]
     pub work_commitment: Vec<u8>,
     /// Present only for a full block solution. Encodes BlockAuthorization.

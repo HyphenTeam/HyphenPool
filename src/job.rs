@@ -13,8 +13,10 @@ pub struct ActiveJob {
     pub epoch_seed: Hash256,
     pub share_difficulty: u64,
     pub created_at: u64,
-    pub arena_size: usize,
-    pub page_size: usize,
+    /// Cunningham chain length every witness must satisfy.
+    pub chain_length: u32,
+    /// Parent work commitment the miner chains into `pow_commitment`.
+    pub parent_work_commitment: Hash256,
     pub clean_jobs: bool,
 }
 
@@ -76,9 +78,17 @@ impl JobManager {
             transactions: tpl.transactions.clone(),
             epoch_seed,
             share_difficulty: self.share_difficulty,
-            created_at: chrono::Utc::now().timestamp() as u64,
-            arena_size: tpl.arena_size as usize,
-            page_size: tpl.page_size as usize,
+            created_at: hyphen_core::timestamp::ntp_adjusted_timestamp_secs(),
+            chain_length: match u32::try_from(tpl.pouw_chain_length) {
+                Ok(length) => length,
+                Err(_) => return Err("template chain length exceeds u32".into()),
+            },
+            parent_work_commitment: Hash256::from_bytes(
+                tpl.parent_work_commitment
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| "template parent work commitment must be exactly 32 bytes")?,
+            ),
             clean_jobs: tpl.clean,
         };
 

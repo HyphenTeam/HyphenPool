@@ -1,34 +1,43 @@
 # Hyphen Pool
 
-[English](README.md)
+Hyphen Pool 是 Hyphen 区块版本 5（PoUW v3）的独立矿池服务。它连接节点的模板协议，向
+矿工下发签名的 Protocol v6 job，自行校验单次使用的 Cunningham 见证链，维护持久化结算
+账本，并通过 Hyphen Wallet 的 payout agent 执行付款。
 
-Hyphen Pool 是 Hyphen 区块版本 3 的独立科学计算矿池。它连接节点模板协议 v3，向矿工提供签名的 Pool Protocol v5 job，独立复算科学检查点和完整区块工作，持久化结算账本，并通过 Hyphen Wallet 的 payout agent 执行付款。
+共识类型、哈希、wire 编码与节点协议在这里不再复制。hyphen-core、hyphen-crypto、
+hyphen-pow、hyphen-transport 以路径依赖引入，且矿池从配置派生链身份，而不是钉死字面量。
 
-## 科学工作验证
+## 份额语义
 
-Pool v5 不接受低哈希。每次提交都会重建绑定矿工身份的区块头，并复算确定性的 64x64 Q12 二维扩散 PDE。
+份额是一份见证列表，不是一个 nonce。对每次提交，矿池会：
 
-- 检查点的迭代数低于区块要求，不携带区块授权。
-- 完整结果必须执行等于区块难度的迭代数，写入 pow_commitment，并包含绑定完整区块头和奖励公钥的矿工签名。
-- 只有承诺、授权、链身份、job 新鲜度和交易绑定全部通过后才向节点提交区块。
-- 旧 Stratum 无法携带科学承诺和 frozen-v3 授权，因此明确拒绝 PoUW 提交。
+1. 拒绝与 job 不一致的链长。
+2. 拒绝本矿池已经认领过的任何见证。
+3. 用节点自己的谓词（verify_witnesses）校验整份列表。
+4. 复算 witness_commitment(parent_commitment, height, witnesses) 并与矿工提交的承诺比对。
 
-BLAKE3 仍用于消息、回执、交易和承诺的完整性，不作为工作接受目标。
+达到 difficulty 个见证的列表就是区块候选：矿池重建矿工签名过的那个区块头，验证其中的矿工
+授权，把 pow_witnesses 装进区块并提交。见证数较少但不少于 share_difficulty 的列表只能获得
+credit。
 
-协议标识为 PoUW v1，但检查点只证明指定的确定性 PDE，不证明用户出资的 AetherCompute 任务、外部科学价值或简洁验证。Pool 的计算速率按每个单元更新 7 次规范算术操作计量，所有检查点都限制在共识最大 4096 次迭代以内。
+credit 只按矿池此前未付过的见证计数，因此先提交前缀、再提交完整列表无法重复记账，重放列表
+也拿不到任何收益。链级别的单次使用由节点用自己的稀疏 Merkle 集合强制执行；矿池镜像该规则，
+让重放在节点看到之前就被拒绝。
 
-## 结算
+因此 share_difficulty 表示见证数量，而非迭代次数。持久化账本字段保留旧名只为兼容。
 
-SOLO、PROP、PPS、PPLNS、PPS+ 和 FPPS 模式仍可用。为了兼容已有账本，持久化字段仍名为 share_difficulty；Pool v5 中该值实际表示已验证的检查点迭代数。
+矿池还会根据矿工上报的算力与解析式见证密度 (1 / ln 2^63)^chain_length 推导 credit 门槛，
+再按 job 自身的难度做上限收敛。会估算是比猜更好，且 job 难度永远优先。
 
-检查点迭代数为 d、区块迭代数为 D、奖励基数为 R、费率为 b 个 basis points 时：
+## Stratum
 
-```text
-gross = floor(R * d / D)
-net   = floor(gross * (10000 - b) / 10000)
-```
+旧 Stratum V1 适配器已移除。Stratum 的提交模型是 nonce 加哈希，无法携带见证列表或矿工区块
+授权，因此 Stratum 矿工在本链上永远无法产出区块。留着它等于给出一个代码无法兑现的兼容承诺。
 
-Pool 对矿工、序号、前一回执、提交承诺和结果签署链式回执。它只能提供防篡改证据，不能证明 Pool 偿付能力或公共数据可用性。
+## 结算模式
+
+SOLO、PROP、PPS、PPLNS、PPS+、FPPS 均保留。对某次提交，credited 见证数为 k、区块需求为 D、
+奖励基数为 R 时，扣矿池费前的记账额为 R * k / D。
 
 ## 构建与运行
 
@@ -36,35 +45,19 @@ Pool 对矿工、序号、前一回执、提交承诺和结果签署链式回执
 cargo build --release --locked
 cargo test --locked
 cargo clippy --all-targets --locked -- -D warnings
-.\target\release\hyphen-pool-server.exe keygen --output .\pool.key
+
+.\target\release\hyphen-pool-server.exe --network devnet --node 127.0.0.1:3350 `
+    --bind 0.0.0.0:3340 --pool-state-dir pool_state
 ```
 
-```powershell
-.\target\release\hyphen-pool-server.exe `
-  --network devnet `
-  --node 127.0.0.1:3350 `
-  --key-file .\pool.key `
-  --bind 127.0.0.1:3340 `
-  --api-bind 127.0.0.1:8081 `
-  --share-difficulty 32 `
-  --payout-mode solo `
-  --pool-state-dir .\pool_state
-```
+## 协议
 
-共享付款模式还必须配置正确网络的钱包、loopback payout agent、认证 token、最小付款额和确认策略。节点 RPC 和付款服务应只位于可信主机。
+- 区块版本：5
+- PoUW 协议：3
+- 模板协议：5（节点到矿池）
+- 矿池协议：6（矿池到矿工）
 
-## 兼容性
+## 局限
 
-- 节点模板协议：3
-- Pool 协议：5
-- 区块版本：3
-- PoUW 协议：1
-- 科学计算固定向量：25078c250c5b44211bbf0fea60e90ac7024df6ff94d154161852fdd72684e524
-
-Miner 和 Pool 会拒绝共识参数哈希或 genesis hash 不匹配的连接。RustBinary 使用有限长度、固定宽度、小端并拒绝尾随字节的编码。已有账本通过显式版本迁移读取；不可读状态会报错，不会静默覆盖。
-
-Pool 不是无信任系统：它可在创建 job 前省略交易、拒绝服务，并控制共享奖励钱包。本软件尚未经过独立经济、共识或付款审计。
-
-## 许可证
-
-Hyphen Pool 使用 PolyForm Strict License 1.0.0，完整条款见 [LICENSE](LICENSE)。
+尚未经过独立审计。链级别的单次使用由节点保证；矿池的认领集合是更严格的本地视图，用于保护
+自己的账本。若区块在矿池记账后被节点拒绝，矿池只会比链更严格——损失的是时效性，不是安全性。

@@ -11,6 +11,7 @@ use tracing::{info, warn};
 use zeroize::Zeroizing;
 
 use crate::accounting::{AccountingError, PayoutRecord, PayoutStatus, PoolAccounting};
+use crate::primitives::hex_decode;
 
 const PROTOCOL_VERSION: u32 = 1;
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
@@ -136,7 +137,7 @@ impl PayoutAgentClient {
                 "agent returned a different payout intent".into(),
             ));
         }
-        if hex::decode(&response.tx_hash).map_or(true, |hash| hash.len() != 32) {
+        if hex_decode(&response.tx_hash).map_or(true, |hash| hash.len() != 32) {
             return Err(PayoutError::Protocol(
                 "agent returned an invalid transaction hash".into(),
             ));
@@ -356,7 +357,7 @@ mod tests {
         let directory = std::env::temp_dir().join(format!(
             "hyphen_pool_worker_test_{}_{}",
             std::process::id(),
-            rand::random::<u64>()
+            crate::random_u64()
         ));
         let accounting = Arc::new(PoolAccounting::new(
             crate::accounting::PoolAccountingConfig {

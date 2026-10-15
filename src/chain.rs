@@ -1,15 +1,15 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use parking_lot::RwLock;
 use prost::Message;
 use tracing::{info, warn};
 
-use crate::pow::{evaluate_pow, EpochArena};
 use crate::primitives::{
-    blake3_hash, blake3_hash_many, Block, BlockHeader, ChainConfig, Hash256, SecretKey,
+    blake3_hash, blake3_hash_many, hex_encode, Block, BlockHeader, ChainConfig, ChainIdentity,
+    Hash256, SecretKey,
 };
+use crate::share::ClaimedWitnesses;
 use crate::tp::*;
 
 /// Percentage of block reward that goes to the network fee pool (burned/treasury)
@@ -25,6 +25,9 @@ pub struct BlockRecord {
     pub height: u64,
     pub timestamp: u64,
     pub difficulty: u64,
+    /// Work commitment this block carries, which its child chains into.
+    #[serde(default)]
+    pub pow_commitment: Hash256,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -50,23 +53,24 @@ pub struct ChainState {
     history: RwLock<Vec<BlockRecord>>,
     cfg: ChainConfig,
     data_dir: Option<PathBuf>,
-    arena_cache: RwLock<Option<(Hash256, Arc<EpochArena>)>>,
     /// Cumulative balances: pubkey_hex → balance
     balances: RwLock<HashMap<String, u128>>,
     /// Dev fund address (fixed, derived from dev key)
     dev_address: String,
+    /// Witnesses this standalone chain has already consumed.
+    claimed_witnesses: RwLock<ClaimedWitnesses>,
 }
 
 impl ChainState {
     pub fn new(cfg: ChainConfig, data_dir: Option<PathBuf>) -> Self {
         let genesis_seed = blake3_hash(b"Hyphen_genesis_epoch_seed");
-        let dev_address = hex::encode(blake3_hash(b"Hyphen_developer_fund").as_bytes());
+        let dev_address = hex_encode(blake3_hash(b"Hyphen_developer_fund").as_bytes());
 
         let state = Self {
             tip: RwLock::new(ChainTip {
                 hash: Hash256::ZERO,
                 height: 0,
-                timestamp: chrono::Utc::now().timestamp() as u64,
+                timestamp: hyphen_core::timestamp::ntp_adjusted_timestamp_secs(),
                 difficulty: cfg.genesis_difficulty,
                 epoch_seed: genesis_seed,
                 cumulative_difficulty: 0,
@@ -74,9 +78,9 @@ impl ChainState {
             history: RwLock::new(Vec::new()),
             cfg,
             data_dir: data_dir.clone(),
-            arena_cache: RwLock::new(None),
             balances: RwLock::new(HashMap::new()),
             dev_address,
+            claimed_witnesses: RwLock::new(ClaimedWitnesses::default()),
         };
 
         if let Some(ref dir) = data_dir {
@@ -163,29 +167,6 @@ impl ChainState {
         self.tip.read().epoch_seed
     }
 
-    fn get_arena(&self, epoch_seed: Hash256) -> Arc<EpochArena> {
-        {
-            let guard = self.arena_cache.read();
-            if let Some((seed, ref a)) = *guard {
-                if seed == epoch_seed {
-                    return Arc::clone(a);
-                }
-            }
-        }
-        info!(
-            "Generating epoch arena ({}MiB) for seed {}…",
-            self.cfg.arena_size / (1024 * 1024),
-            epoch_seed
-        );
-        let arena = Arc::new(EpochArena::generate(
-            epoch_seed,
-            self.cfg.arena_size,
-            self.cfg.page_size,
-        ));
-        *self.arena_cache.write() = Some((epoch_seed, Arc::clone(&arena)));
-        arena
-    }
-
     pub fn generate_template(&self, miner_pubkey: [u8; 32]) -> BlockTemplate {
         let tip = self.tip.read().clone();
         let next_height = tip.height + 1;
@@ -195,7 +176,7 @@ impl ChainState {
         let header = BlockHeader {
             version: crate::primitives::FROZEN_BLOCK_VERSION,
             height: next_height,
-            timestamp: chrono::Utc::now().timestamp() as u64,
+            timestamp: hyphen_core::timestamp::ntp_adjusted_timestamp_secs(),
             prev_hash: tip.hash,
             tx_root: Hash256::ZERO,
             commitment_root: Hash256::ZERO,
@@ -234,13 +215,23 @@ impl ChainState {
             total_fee: 0,
             epoch_seed: tip.epoch_seed.as_bytes().to_vec(),
             prev_hash: tip.hash.as_bytes().to_vec(),
-            arena_size: self.cfg.arena_size as u64,
-            page_size: self.cfg.page_size as u64,
+            pouw_chain_length: self.cfg.pouw_chain_length as u64,
+            parent_work_commitment: self
+                .history
+                .read()
+                .last()
+                .map(|record| record.pow_commitment)
+                .unwrap_or(Hash256::ZERO)
+                .as_bytes()
+                .to_vec(),
             clean: true,
             network_magic: self.cfg.network_magic.to_vec(),
-            protocol_version: 3,
-            consensus_params_hash: self.cfg.consensus_params_hash().to_vec(),
-            genesis_hash: self.cfg.genesis_hash().to_vec(),
+            protocol_version: hyphen_transport::POOL_PROTOCOL_VERSION,
+            consensus_params_hash: ChainIdentity::of(&self.cfg).consensus_params_hash.to_vec(),
+            genesis_hash: ChainIdentity::of(&self.cfg)
+                .genesis_hash
+                .as_bytes()
+                .to_vec(),
         }
     }
 
@@ -264,7 +255,7 @@ impl ChainState {
             ));
         }
 
-        let now = chrono::Utc::now().timestamp() as u64;
+        let now = hyphen_core::timestamp::ntp_adjusted_timestamp_secs();
         if block.header.timestamp > now + self.cfg.timestamp_future_limit_ms / 1000 {
             return Err("timestamp too far in the future".into());
         }
@@ -272,10 +263,48 @@ impl ChainState {
             return Err("timestamp must be after parent".into());
         }
 
-        let arena = self.get_arena(tip.epoch_seed);
-        let work_commitment = evaluate_pow(&block.header, &arena, &self.cfg);
-        if work_commitment == Hash256::ZERO || work_commitment != block.header.pow_commitment {
-            return Err("scientific PoUW commitment verification failed".into());
+        // Witness validation mirrors the node: predicate first, then single use,
+        // then the chained commitment. Rejecting in that order keeps a malformed
+        // list from ever touching the claimed set.
+        let count = block.pow_witnesses.len() as u64;
+        if count != block.header.difficulty {
+            return Err(format!(
+                "proof of work rejected: {} witnesses for a block that requires {}",
+                count, block.header.difficulty
+            ));
+        }
+        if let Err(error) = hyphen_pow::vms::verify_witnesses(
+            &block.pow_witnesses,
+            self.cfg.pouw_chain_length,
+            count,
+        ) {
+            return Err(format!("proof of work rejected: {error}"));
+        }
+        {
+            let claimed = self.claimed_witnesses.read();
+            if let Some(duplicate) = block
+                .pow_witnesses
+                .iter()
+                .find(|witness| claimed.contains(**witness))
+            {
+                return Err(format!(
+                    "proof of work rejected: witness {duplicate} was already claimed"
+                ));
+            }
+        }
+        let parent_commitment = self
+            .history
+            .read()
+            .last()
+            .map(|record| record.pow_commitment)
+            .unwrap_or(Hash256::ZERO);
+        let expected = hyphen_pow::vms::witness_commitment(
+            &parent_commitment,
+            block.header.height,
+            &block.pow_witnesses,
+        );
+        if expected != block.header.pow_commitment {
+            return Err("work commitment does not match the claimed witness list".into());
         }
 
         let block_hash = block.hash();
@@ -291,7 +320,9 @@ impl ChainState {
             height: block.header.height,
             timestamp: block.header.timestamp,
             difficulty: block.header.difficulty,
+            pow_commitment: block.header.pow_commitment,
         };
+        self.claimed_witnesses.write().claim(&block.pow_witnesses);
 
         {
             let mut history = self.history.write();
@@ -316,7 +347,7 @@ impl ChainState {
 
         let total_reward = block.header.reward;
         if total_reward > 0 {
-            let miner_key = hex::encode(block.header.miner_pubkey);
+            let miner_key = hex_encode(block.header.miner_pubkey);
             let network_share = total_reward * REWARD_NETWORK_PCT / 100;
             let dev_share = total_reward * REWARD_DEV_PCT / 100;
             let miner_share = total_reward - network_share - dev_share;
@@ -392,14 +423,14 @@ impl ChainState {
         let down = cur.saturating_sub(cur / self.cfg.difficulty_clamp_down);
 
         next.clamp(down.max(1), up)
-            .min(crate::pow::MAX_POUW_ITERATIONS)
+            .min(hyphen_pow::vms::MAX_WITNESSES_PER_BLOCK)
     }
 
     fn calculate_reward(&self, height: u64) -> u64 {
         if self.cfg.tail_emission_height > 0 && height >= self.cfg.tail_emission_height {
             return self.cfg.tail_emission;
         }
-        let halvings = height / self.cfg.emission_half_life;
+        let halvings = height / self.cfg.emission_decay_constant;
         if halvings >= 64 {
             return self.cfg.tail_emission;
         }
