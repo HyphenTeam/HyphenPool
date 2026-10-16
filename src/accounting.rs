@@ -13,7 +13,18 @@ const ACCOUNTING_STATE_MAGIC: &[u8; 16] = b"HyPoolAccountV1\0";
 type RecipientKey = ([u8; 32], [u8; 32]);
 type RecipientBalances = Vec<(String, u128)>;
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Eq,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    ValueEnum,
+    rustbinary::CompactBinary,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum PoolMode {
     #[default]
@@ -65,7 +76,7 @@ pub struct PoolAccountingConfig {
     pub state_dir: Option<PathBuf>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, rustbinary::CompactBinary)]
 struct ShareCredit {
     miner_pubkey: [u8; 32],
     wallet_address: [u8; 32],
@@ -73,7 +84,7 @@ struct ShareCredit {
     timestamp: u64,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, rustbinary::CompactBinary)]
 pub struct MinerLedger {
     pub wallet_address: [u8; 32],
     #[serde(default)]
@@ -91,7 +102,7 @@ pub struct MinerLedger {
     pub last_disconnect_timestamp: Option<u64>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, rustbinary::CompactBinary)]
 #[serde(rename_all = "snake_case")]
 pub enum PayoutStatus {
     Reserved,
@@ -107,13 +118,13 @@ pub enum PayoutStatus {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, rustbinary::CompactBinary)]
 struct PayoutAllocation {
     miner_key: String,
     amount_atomic: u128,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, rustbinary::CompactBinary)]
 pub struct PayoutRecord {
     pub intent_id: String,
     pub recipient_view_public: [u8; 32],
@@ -152,7 +163,7 @@ pub enum AccountingError {
     InvalidNetwork,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, rustbinary::CompactBinary)]
 pub struct BlockSettlement {
     pub height: u64,
     pub block_hash_hex: String,
@@ -170,7 +181,7 @@ pub struct BlockSettlement {
     pub timestamp: u64,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, rustbinary::CompactBinary)]
 #[serde(rename_all = "snake_case")]
 pub enum RewardEventKind {
     DirectCoinbase,
@@ -178,7 +189,7 @@ pub enum RewardEventKind {
     FeeSettlement,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, rustbinary::CompactBinary)]
 pub struct WalletRewardEvent {
     pub height: u64,
     pub block_hash_hex: String,
@@ -216,7 +227,7 @@ pub struct WalletLedgerSummary {
     pub recent_payouts: Vec<PayoutRecord>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, rustbinary::CompactBinary)]
 struct AccountingState {
     mode: PoolMode,
     pool_fee_bps: u16,
@@ -235,7 +246,7 @@ struct AccountingState {
     next_payout_sequence: u64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, rustbinary::CompactBinary)]
 struct LegacyMinerLedgerV0 {
     wallet_address: [u8; 32],
     valid_shares: u64,
@@ -249,7 +260,7 @@ struct LegacyMinerLedgerV0 {
     last_disconnect_timestamp: Option<u64>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, rustbinary::CompactBinary)]
 struct LegacyAccountingStateV0 {
     mode: PoolMode,
     pool_fee_bps: u16,

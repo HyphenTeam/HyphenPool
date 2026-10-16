@@ -68,12 +68,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
-name = "arrayref"
-version = "0.3.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76a2e8124351fda1ef8aaaa3bbd7ebbcb486bbcd4225aca0aa0d84bb2db8fecb"
-
-[[package]]
 name = "arrayvec"
 version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -81,9 +75,9 @@ checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 
 [[package]]
 name = "async-trait"
-version = "0.1.91"
+version = "0.1.92"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae36dc4177970ef04fde5178d3e2429882def40e57a451f919c098f72baa6cec"
+checksum = "82f6aeea286b8eb4dd3431a1be1b59d290ace00f5bfd8e2a159bc2a05e2c1667"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -162,11 +156,10 @@ checksum = "843867be96c8daad0d758b57df9392b6d8d271134fce549de6ce169ff98a92af"
 
 [[package]]
 name = "blake3"
-version = "1.8.5"
+version = "1.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0aa83c34e62843d924f905e0f5c866eb1dd6545fc4d719e803d9ba6030371fce"
+checksum = "6d9e454fc11f76977dc803893aff6304ed33d6a26efae8696573bea74baa27ae"
 dependencies = [
- "arrayref",
  "arrayvec",
  "cc",
  "cfg-if",
@@ -561,6 +554,7 @@ name = "hyphen-core"
 version = "0.1.0"
 dependencies = [
  "hyphen-crypto",
+ "hyphen-wire",
  "parking_lot",
  "rand",
  "rustbinary",
@@ -580,6 +574,7 @@ dependencies = [
  "merlin",
  "rand",
  "rand_core 0.10.1",
+ "rustbinary",
  "serde",
  "thiserror",
  "zeroize",
@@ -598,6 +593,7 @@ dependencies = [
  "hyphen-transport",
  "parking_lot",
  "prost",
+ "rustbinary",
  "serde",
  "serde_json",
  "thiserror",
@@ -618,6 +614,7 @@ dependencies = [
  "parking_lot",
  "rand",
  "rand_chacha",
+ "rustbinary",
  "serde",
  "thiserror",
 ]
@@ -632,6 +629,14 @@ dependencies = [
  "rand",
  "thiserror",
  "tokio",
+]
+
+[[package]]
+name = "hyphen-wire"
+version = "0.1.0"
+dependencies = [
+ "rustbinary",
+ "serde",
 ]
 
 [[package]]
@@ -740,6 +745,21 @@ dependencies = [
  "wasi",
  "windows-sys",
 ]
+
+[[package]]
+name = "nextjson"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57e11456b12f6d0776f7e431232b638d1315a3deffd790b0bf818277a7d8efca"
+dependencies = [
+ "nextjson-derive",
+]
+
+[[package]]
+name = "nextjson-derive"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "84d8161c22b5b2d74b022b89480cdced97c716e9f819bf123fec0d810cb8bb86"
 
 [[package]]
 name = "nu-ansi-term"
@@ -923,19 +943,19 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
 name = "rustbinary"
-version = "0.1.2"
+version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b658eb55cca5a717eaa999d09ba641dc079d3213a5f36258ee272e29033135fc"
+checksum = "229bae73c7a1daecd8f504d382ea8372683d1b2b30962048b051218ee96a6e7f"
 dependencies = [
+ "nextjson",
  "rustbinary-derive",
- "serde",
 ]
 
 [[package]]
 name = "rustbinary-derive"
-version = "0.1.2"
+version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "21d5213a446a0842c329fb2161d81b67f0447f6043b3c8dc294028398d1b1b2c"
+checksum = "c8ff15f5a7a6c6048ff7b7984847585e7cc70f36d80ed431bfbda42417f961c9"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1381,9 +1401,9 @@ dependencies = [
 
 [[package]]
 name = "zeroize"
-version = "1.9.0"
+version = "1.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e13c156562582aa81c60cb29407084cdb54c4164760106ab78e6c5b0858cf64e"
+checksum = "e13084392c5e4bc371903e2935a5eaeed24905a7511356b883835e18a78f6879"
 dependencies = [
  "zeroize_derive",
 ]

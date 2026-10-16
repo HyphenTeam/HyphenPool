@@ -19,7 +19,7 @@ pub const REWARD_DEV_PCT: u64 = 35;
 /// Percentage of block reward that goes to the miner
 pub const REWARD_MINER_PCT: u64 = 60;
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, rustbinary::CompactBinary)]
 pub struct BlockRecord {
     pub hash: Hash256,
     pub height: u64,
@@ -30,7 +30,7 @@ pub struct BlockRecord {
     pub pow_commitment: Hash256,
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, rustbinary::CompactBinary)]
 struct ChainTip {
     hash: Hash256,
     height: u64,
@@ -40,7 +40,7 @@ struct ChainTip {
     cumulative_difficulty: u128,
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize, rustbinary::CompactBinary)]
 struct PersistedState {
     tip: ChainTip,
     history: Vec<BlockRecord>,
