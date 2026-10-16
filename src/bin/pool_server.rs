@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 use tracing::info;
 
 use hyphen_pool::accounting::{PoolAccounting, PoolAccountingConfig, PoolMode};
-use hyphen_pool::api::start_pool_api;
+use hyphen_pool::api::{load_tls_identity, start_pool_api};
 use hyphen_pool::job::JobManager;
 use hyphen_pool::payout::{load_token_file, PayoutAgentClient, PayoutWorker, PayoutWorkerConfig};
 use hyphen_pool::primitives::{hex_encode, ChainConfig, SecretKey};
@@ -66,6 +66,15 @@ struct Cli {
     /// Disable pool accounting HTTP API
     #[arg(long)]
     no_api: bool,
+
+    /// PEM certificate chain for the accounting API. Requires --api-tls-key.
+    /// With both, the API is served over HTTPS (HTTP/2 via ALPN).
+    #[arg(long, default_value = "")]
+    api_tls_cert: String,
+
+    /// PEM private key for the accounting API. Requires --api-tls-cert.
+    #[arg(long, default_value = "")]
+    api_tls_key: String,
 
     /// Pool payout mode
     #[arg(long, value_enum, default_value_t = PoolMode::Solo)]
@@ -327,24 +336,30 @@ async fn start_pool<T: TemplateProvider + Send + Sync + 'static>(
         tokio::spawn(async move { p.run().await })
     };
 
-    let api_handle = if !cli.no_api {
-        info!("Pool API: bind={}", api_addr);
-        let accounting = Arc::clone(&accounting);
-        Some(tokio::spawn(async move {
-            start_pool_api(api_addr, accounting).await
-        }))
-    } else {
+    let api = if cli.no_api {
+        info!("Pool accounting API disabled by --no-api");
         None
+    } else {
+        // Bound before the async pool loop starts: a port that is taken, or a
+        // certificate that does not load, fails the process at startup instead
+        // of after miners have committed to this pool.
+        let tls = load_tls_identity(tls_arg(&cli.api_tls_cert), tls_arg(&cli.api_tls_key))?;
+        Some(start_pool_api(api_addr, Arc::clone(&accounting), tls)?)
     };
 
     pool_handle.await??;
-    if let Some(h) = api_handle {
-        let _ = h.await?;
-    }
+    // Dropping the API closes its listener; the pool loop has ended, so the
+    // process is on its way down and nothing should still be served.
+    drop(api);
     if let Some(h) = payout_handle {
         h.abort();
         let _ = h.await;
     }
 
     Ok(())
+}
+
+/// An empty flag value means "not given", so the CLI keeps plain defaults.
+fn tls_arg(value: &str) -> Option<&str> {
+    (!value.is_empty()).then_some(value)
 }

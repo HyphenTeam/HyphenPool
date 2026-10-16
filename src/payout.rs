@@ -3,18 +3,28 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use courierust::courierust_client::{Client, ClientConfig};
+use courierust::courierust_http::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::task::spawn_blocking;
 use tracing::{info, warn};
 use zeroize::Zeroizing;
 
 use crate::accounting::{AccountingError, PayoutRecord, PayoutStatus, PoolAccounting};
 use crate::primitives::hex_decode;
 
-const PROTOCOL_VERSION: u32 = 1;
+const PROTOCOL_VERSION: u32 = 2;
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+
+/// Reachable-or-not deadline for the loopback agent. Paying a wallet is the
+/// pool's slowest operation, and the agent waits on the chain to sign and
+/// submit, so the read budget is the long one.
+const AGENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const AGENT_READ_TIMEOUT: Duration = Duration::from_secs(90);
+
+const HEALTH_PATH: &str = "/v1/health";
+const SUBMIT_PATH: &str = "/v1/submit";
 
 #[derive(Clone, Debug)]
 pub struct PayoutWorkerConfig {
@@ -49,17 +59,13 @@ struct AgentResponse {
 }
 
 #[derive(Debug, Serialize)]
-struct HealthRequest<'a> {
+struct HealthRequest {
     version: u32,
-    token: &'a str,
-    method: &'static str,
 }
 
 #[derive(Debug, Serialize)]
 struct SubmitRequest<'a> {
     version: u32,
-    token: &'a str,
-    method: &'static str,
     intent_id: &'a str,
     recipient_address: &'a str,
     amount_atomic: u64,
@@ -81,9 +87,20 @@ pub enum PayoutError {
     Accounting(#[from] AccountingError),
 }
 
+/// The payout link to `hyphen-payout-agent`.
+///
+/// The agent serves HTTP on loopback and this is the client: Courierust is on
+/// both ends of the link, so the two halves are one implementation of HTTP
+/// rather than two hand-rolled codecs. The shared token travels in the
+/// `authorization` header — never in the payload, so a body can be logged or
+/// echoed without leaking it — and the version field still guards a pool that
+/// was upgraded without its agent.
+///
+/// Courierust's client is blocking. [`PayoutWorker`] calls it from the blocking
+/// pool, which keeps the reactor free for shares and the accounting API.
 pub struct PayoutAgentClient {
     endpoint: SocketAddr,
-    token: Zeroizing<String>,
+    client: Client,
     expected_wallet_address: String,
 }
 
@@ -99,39 +116,55 @@ impl PayoutAgentClient {
         if token.len() < 32 || token.len() > 256 {
             return Err(PayoutError::InvalidToken);
         }
+
+        // The header value is the client's to keep for the life of the link; the
+        // working copy here is zeroized as soon as it has been handed over.
+        let credential = Zeroizing::new(format!("Bearer {token}"));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_lowercase("authorization"),
+            HeaderValue::from(credential.as_str()),
+        );
+        let config = ClientConfig {
+            connect_timeout: Some(AGENT_CONNECT_TIMEOUT),
+            read_timeout: Some(AGENT_READ_TIMEOUT),
+            max_body: MAX_RESPONSE_BYTES,
+            max_header_list: 16 * 1024,
+            default_headers: headers,
+            ..ClientConfig::default()
+        };
+
         Ok(Self {
             endpoint,
-            token: Zeroizing::new(token),
+            client: Client::with_config(config),
             expected_wallet_address,
         })
     }
 
-    pub async fn health(&self) -> Result<u64, PayoutError> {
-        let request = HealthRequest {
-            version: PROTOCOL_VERSION,
-            token: self.token.as_str(),
-            method: "health",
-        };
-        let response = self.call(&request).await?;
-        self.validate_response(&response)?;
+    pub fn health(&self) -> Result<u64, PayoutError> {
+        let response = self.call(
+            HEALTH_PATH,
+            &HealthRequest {
+                version: PROTOCOL_VERSION,
+            },
+        )?;
         Ok(response.fee_atomic)
     }
 
-    async fn submit(
+    fn submit(
         &self,
         payout: &PayoutRecord,
         recipient_address: &str,
     ) -> Result<AgentResponse, PayoutError> {
-        let request = SubmitRequest {
-            version: PROTOCOL_VERSION,
-            token: self.token.as_str(),
-            method: "submit",
-            intent_id: &payout.intent_id,
-            recipient_address,
-            amount_atomic: payout.amount_atomic,
-        };
-        let response = self.call(&request).await?;
-        self.validate_response(&response)?;
+        let response = self.call(
+            SUBMIT_PATH,
+            &SubmitRequest {
+                version: PROTOCOL_VERSION,
+                intent_id: &payout.intent_id,
+                recipient_address,
+                amount_atomic: payout.amount_atomic,
+            },
+        )?;
         if response.intent_id != payout.intent_id {
             return Err(PayoutError::Protocol(
                 "agent returned a different payout intent".into(),
@@ -145,46 +178,42 @@ impl PayoutAgentClient {
         Ok(response)
     }
 
-    async fn call<T: Serialize>(&self, request: &T) -> Result<AgentResponse, PayoutError> {
-        let bytes = serde_json::to_vec(request)
+    fn call<T: Serialize>(&self, path: &str, request: &T) -> Result<AgentResponse, PayoutError> {
+        let payload = serde_json::to_vec(request)
             .map_err(|error| PayoutError::Protocol(error.to_string()))?;
-        let operation = async {
-            let mut stream = TcpStream::connect(self.endpoint)
-                .await
-                .map_err(|error| PayoutError::Io(error.to_string()))?;
-            stream
-                .write_all(&bytes)
-                .await
-                .map_err(|error| PayoutError::Io(error.to_string()))?;
-            stream
-                .shutdown()
-                .await
-                .map_err(|error| PayoutError::Io(error.to_string()))?;
+        let url = format!("http://{}{path}", self.endpoint);
+        let response = self
+            .client
+            .post(&url, payload)
+            .map_err(|error| PayoutError::Io(error.to_string()))?;
+        let status = response.status;
 
-            let mut response_bytes = Vec::new();
-            stream
-                .take((MAX_RESPONSE_BYTES + 1) as u64)
-                .read_to_end(&mut response_bytes)
-                .await
-                .map_err(|error| PayoutError::Io(error.to_string()))?;
-            if response_bytes.len() > MAX_RESPONSE_BYTES {
-                return Err(PayoutError::Protocol(
-                    "payout-agent response exceeds 64 KiB".into(),
-                ));
-            }
-            serde_json::from_slice(&response_bytes)
-                .map_err(|error| PayoutError::Protocol(error.to_string()))
-        };
-        tokio::time::timeout(Duration::from_secs(90), operation)
-            .await
-            .map_err(|_| PayoutError::Io("payout-agent request timed out".into()))?
+        // The agent answers with its own JSON in both directions, so its message
+        // is preferred over a bare status code: an operator reading the pool log
+        // should see "authentication failed", not "HTTP 401".
+        let body = response
+            .text()
+            .map_err(|error| PayoutError::Protocol(format!("payout agent body: {error}")))?;
+        let response: AgentResponse = serde_json::from_str(&body)
+            .map_err(|error| PayoutError::Protocol(format!("payout agent body: {error}")))?;
+
+        if status.as_u16() != 200 {
+            return Err(PayoutError::Protocol(if response.error.is_empty() {
+                format!("payout agent answered HTTP {}", status.as_u16())
+            } else {
+                response.error.clone()
+            }));
+        }
+        self.validate_response(&response)?;
+        Ok(response)
     }
 
     fn validate_response(&self, response: &AgentResponse) -> Result<(), PayoutError> {
         if response.version != PROTOCOL_VERSION {
-            return Err(PayoutError::Protocol(
-                "agent returned an unsupported protocol version".into(),
-            ));
+            return Err(PayoutError::Protocol(format!(
+                "agent speaks payout protocol {} but this pool speaks {PROTOCOL_VERSION}",
+                response.version
+            )));
         }
         if !response.ok {
             return Err(PayoutError::Protocol(response.error.clone()));
@@ -200,7 +229,7 @@ impl PayoutAgentClient {
 
 pub struct PayoutWorker {
     accounting: Arc<PoolAccounting>,
-    client: PayoutAgentClient,
+    client: Arc<PayoutAgentClient>,
     config: PayoutWorkerConfig,
 }
 
@@ -221,15 +250,30 @@ impl PayoutWorker {
         }
         Ok(Self {
             accounting,
-            client,
+            client: Arc::new(client),
             config,
         })
     }
 
     pub async fn verify_agent(&self) -> Result<(), PayoutError> {
-        let fee = self.client.health().await?;
+        let fee = self.call_agent(|client| client.health()).await?;
         info!("Automatic payout agent verified; transaction fee={fee}");
         Ok(())
+    }
+
+    /// Runs one client call on the blocking pool.
+    ///
+    /// Courierust's client is a blocking HTTP client; a payout reconciliation
+    /// must not stall the reactor that is serving shares and the accounting API.
+    async fn call_agent<T, F>(&self, call: F) -> Result<T, PayoutError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&PayoutAgentClient) -> Result<T, PayoutError> + Send + 'static,
+    {
+        let client = Arc::clone(&self.client);
+        spawn_blocking(move || call(&client))
+            .await
+            .map_err(|error| PayoutError::Io(format!("payout agent task failed: {error}")))?
     }
 
     pub async fn run(self) {
@@ -255,7 +299,10 @@ impl PayoutWorker {
             },
         };
         let recipient = payout.recipient_address(self.accounting.network_magic())?;
-        let response = self.client.submit(&payout, &recipient).await?;
+        let submission = payout.clone();
+        let response = self
+            .call_agent(move |client| client.submit(&submission, &recipient))
+            .await?;
 
         if let PayoutStatus::Submitted { tx_hash, .. } | PayoutStatus::Confirmed { tx_hash, .. } =
             &payout.status
@@ -313,7 +360,11 @@ fn is_loopback(ip: IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::net::TcpListener;
+    use courierust::courierust_body::Body as AgentBody;
+    use courierust::courierust_http::request::Request as AgentRequestWire;
+    use courierust::courierust_http::response::Response as AgentResponseWire;
+    use courierust::courierust_http::StatusCode;
+    use courierust::courierust_server::{Server, ServerConfig};
 
     #[test]
     fn client_rejects_non_loopback_agent() {
@@ -376,39 +427,67 @@ mod tests {
         accounting.register_miner(miner, recipient);
         accounting.record_valid_share(miner, recipient, 1, 1, 100, 0);
 
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = listener.local_addr().unwrap();
+        let server = Server::bind_with_config(
+            "127.0.0.1:0",
+            ServerConfig {
+                http2: false,
+                max_body: MAX_RESPONSE_BYTES,
+                ..ServerConfig::default()
+            },
+        )
+        .unwrap();
+        let endpoint = server.local_addr().unwrap();
         let pool_wallet = accounting.pool_wallet_address().unwrap();
         let expected_wallet = pool_wallet.clone();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut request = Vec::new();
-            stream.read_to_end(&mut request).await.unwrap();
-            let request: serde_json::Value = serde_json::from_slice(&request).unwrap();
-            assert_eq!(request["method"], "submit");
-            assert_eq!(request["amount_atomic"], 90);
-            let response = serde_json::json!({
-                "version": 1,
-                "ok": true,
-                "error": "",
-                "wallet_address": expected_wallet,
-                "fee_atomic": 1,
-                "intent_id": request["intent_id"],
-                "tx_hash": "ab".repeat(32),
-                "status": {
-                    "state": "confirmed",
-                    "block_hash_hex": "cd".repeat(32),
-                    "block_height": 10,
-                    "confirmations": 20
-                }
-            });
-            stream
-                .write_all(&serde_json::to_vec(&response).unwrap())
-                .await
-                .unwrap();
-        });
+        let token = Zeroizing::new("x".repeat(32));
+        let expected_token = token.clone();
+        let agent = server
+            .serve_background(move |request: AgentRequestWire<AgentBody>| {
+                let mut response = AgentResponseWire::<AgentBody>::with_status(StatusCode::OK);
+                response
+                    .headers
+                    .insert("content-type".into(), "application/json".into());
 
-        let client = PayoutAgentClient::new(endpoint, "x".repeat(32), pool_wallet).unwrap();
+                // The agent is authenticated by header, never by payload.
+                let authorized = request
+                    .headers
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    .map(|value| value == format!("Bearer {}", expected_token.as_str()))
+                    .unwrap_or(false);
+                if !authorized || request.uri.path() != SUBMIT_PATH {
+                    response.status = StatusCode::UNAUTHORIZED;
+                    response.body = AgentBody::from("{\"error\":\"authentication failed\"}");
+                    return response;
+                }
+
+                let request: serde_json::Value =
+                    serde_json::from_slice(&request.body.collect().unwrap_or_default()).unwrap();
+                assert_eq!(request["version"], 2);
+                assert_eq!(request["amount_atomic"], 90);
+
+                let body = serde_json::json!({
+                    "version": 2,
+                    "ok": true,
+                    "error": "",
+                    "wallet_address": expected_wallet,
+                    "fee_atomic": 1,
+                    "intent_id": request["intent_id"],
+                    "tx_hash": "ab".repeat(32),
+                    "status": {
+                        "state": "confirmed",
+                        "block_hash_hex": "cd".repeat(32),
+                        "block_height": 10,
+                        "confirmations": 20
+                    }
+                });
+                response.body = AgentBody::from(serde_json::to_vec(&body).unwrap());
+                response
+            })
+            .unwrap();
+
+        let client = PayoutAgentClient::new(endpoint, token.as_str().to_string(), pool_wallet)
+            .expect("the loopback agent client is valid");
         let worker = PayoutWorker::new(
             Arc::clone(&accounting),
             client,
@@ -421,7 +500,7 @@ mod tests {
         )
         .unwrap();
         worker.process_once().await.unwrap();
-        server.await.unwrap();
+        agent.stop();
 
         let ledger = accounting.miner_ledger(&miner).unwrap();
         assert_eq!(ledger.pending_payout_atomic, 9);

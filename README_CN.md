@@ -50,6 +50,35 @@ cargo clippy --all-targets --locked -- -D warnings
     --bind 0.0.0.0:3340 --pool-state-dir pool_state
 ```
 
+## 结算 API
+
+矿池通过 HTTP 提供账本查询。Explorer 从另一个 origin 读取，因此授权是宽松的，但这里的数据
+并非机密——它们已经在链上，或可由链上数据推导：
+
+```text
+GET /healthz                                    给监管进程的存活探测
+GET /api/pool/info                              模式、矿池费率、矿池钱包
+GET /api/pool/wallet/{wallet}/balance?limit=16  单个钱包的账本
+```
+
+`--api-bind` 指定监听地址（默认 `0.0.0.0:8081`），`--no-api` 完全关闭。`--api-tls-cert` 与
+`--api-tls-key` 接收 PEM 证书链及其私钥，用 HTTPS + HTTP/2 提供同样的路由；只给其中一个是
+启动错误，绝不会静默降级为明文。
+
+请求有明确上限：请求体 8 KiB、头部 32 KiB、完整请求头 15 秒绝对期限、512 个并发连接。余额
+响应带 `cache-control: no-store`；进程退出前监听器会被关闭并 join（而不是只发信号），因此
+重启的矿池不会发现端口仍被占用。
+
+API 由 Courierust 的 HTTP/1.1 + HTTP/2 栈提供，依赖图中没有路由框架，也没有 service layer。
+
+## 付款链路
+
+矿池通过 loopback HTTP 与 `hyphen-payout-agent` 通信，两端都是 Courierust：
+`POST /v1/health`、`POST /v1/submit`、`POST /v1/status`，共享密钥来自 `--payout-token-file`，
+放在 `authorization: Bearer` 头中，由 agent 在恒定时间内比较。状态码承载传输层结果；agent
+自身的判定（包括拒绝付款的原因）通过响应体的 `ok` 与 `error` 返回；协议版本不一致会直接
+拒绝，而不是被误读。
+
 ## 协议
 
 - 区块版本：5

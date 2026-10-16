@@ -62,6 +62,42 @@ cargo clippy --all-targets --locked -- -D warnings
     --bind 0.0.0.0:3340 --pool-state-dir pool_state
 ```
 
+## Accounting API
+
+The pool serves its ledger over HTTP. The explorer reads it from another origin,
+so the grant is permissive while the data is not secret — it is already on chain
+or derivable from it:
+
+```text
+GET /healthz                                    liveness for supervisors
+GET /api/pool/info                              mode, pool fee, pool wallet
+GET /api/pool/wallet/{wallet}/balance?limit=16  one wallet's ledger
+```
+
+`--api-bind` sets the listener (`0.0.0.0:8081` by default) and `--no-api`
+disables it. `--api-tls-cert` plus `--api-tls-key` take a PEM certificate chain
+and its private key and serve the same routes over HTTPS with HTTP/2; giving only
+one of the two is a startup error, never a silent downgrade to plaintext.
+
+Requests are bounded: 8 KiB of body, 32 KiB of headers, a 15-second deadline for
+the complete request head, 512 concurrent connections. Balances answer with
+`cache-control: no-store`, and the listener is closed — joined, not merely
+signalled — before the process exits, so a restarted pool never finds its port
+still held.
+
+The API is served by Courierust's HTTP/1.1 + HTTP/2 stack. There is no router
+framework and no service-layer stack in the pool's dependency graph.
+
+## Payout link
+
+The pool speaks to `hyphen-payout-agent` over loopback HTTP, also Courierust on
+both ends: `POST /v1/health`, `POST /v1/submit`, `POST /v1/status`, with the
+shared `--payout-token-file` secret in an `authorization: Bearer` header,
+compared in constant time by the agent. Status codes carry the transport
+outcome; the agent's own decision — including why a payment was refused — comes
+back in the body with `ok` and `error`, and a protocol-version mismatch is
+refused rather than misread.
+
 ## Protocol
 
 - Block version: 5
