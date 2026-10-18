@@ -7,12 +7,11 @@ durable accounting, and drives payouts through Hyphen Wallet's payout agent.
 
 Consensus types, hashing, the wire profile, and the node protocol are not copied
 here. `hyphen-core`, `hyphen-crypto`, `hyphen-pow`, and `hyphen-transport` are
-consumed from the public Hyphen revision
-`576bc67d972d1156fbabb1ddf579104d5ff2ff88` pinned in `Cargo.toml` and
-`Cargo.lock`, and the pool derives the chain identity from its configuration
-instead of pinning literals. There is no path dependency on a base-chain
-checkout: CI builds this repository from a clean clone. A protocol change is a
-coordinated revision bump followed by the compatibility checks below.
+consumed from the sibling `crates/` tree of `HyphenTeam/Hyphen`; CI and the
+release workflow materialize `../Cargo.toml`, `../crates` and `../LICENSE`
+before building. The pool derives the chain identity from its configuration
+instead of pinning literals. A protocol change is tested in both trees from one
+checkout, then released with the base commit recorded in the archive metadata.
 
 ## Share semantics
 

@@ -31,3 +31,6 @@ tokio = { version = "1.53.1", features = ["full"] }
 tracing = "0.1"
 zeroize = { version = "1.9.0", features = ["derive"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+blake3 = "1.8.7"
