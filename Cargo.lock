@@ -377,6 +377,7 @@ dependencies = [
 [[package]]
 name = "hyphen-core"
 version = "0.1.1"
+source = "git+https://github.com/HyphenTeam/Hyphen.git?rev=c57f908464df6634eba829e8267f9c5330b3a4b4#c57f908464df6634eba829e8267f9c5330b3a4b4"
 dependencies = [
  "hyphen-crypto",
  "hyphen-wire",
@@ -393,6 +394,7 @@ dependencies = [
 [[package]]
 name = "hyphen-crypto"
 version = "0.1.1"
+source = "git+https://github.com/HyphenTeam/Hyphen.git?rev=c57f908464df6634eba829e8267f9c5330b3a4b4#c57f908464df6634eba829e8267f9c5330b3a4b4"
 dependencies = [
  "blake3",
  "curve25519-dalek",
@@ -409,6 +411,7 @@ dependencies = [
 [[package]]
 name = "hyphen-neural"
 version = "0.1.1"
+source = "git+https://github.com/HyphenTeam/Hyphen.git?rev=c57f908464df6634eba829e8267f9c5330b3a4b4#c57f908464df6634eba829e8267f9c5330b3a4b4"
 dependencies = [
  "clap",
 ]
@@ -441,6 +444,7 @@ dependencies = [
 [[package]]
 name = "hyphen-pow"
 version = "0.1.1"
+source = "git+https://github.com/HyphenTeam/Hyphen.git?rev=c57f908464df6634eba829e8267f9c5330b3a4b4#c57f908464df6634eba829e8267f9c5330b3a4b4"
 dependencies = [
  "blake3",
  "hyphen-core",
@@ -450,6 +454,7 @@ dependencies = [
 [[package]]
 name = "hyphen-transport"
 version = "0.1.1"
+source = "git+https://github.com/HyphenTeam/Hyphen.git?rev=c57f908464df6634eba829e8267f9c5330b3a4b4#c57f908464df6634eba829e8267f9c5330b3a4b4"
 dependencies = [
  "async-trait",
  "hyphen-crypto",
@@ -462,6 +467,7 @@ dependencies = [
 [[package]]
 name = "hyphen-wire"
 version = "0.1.1"
+source = "git+https://github.com/HyphenTeam/Hyphen.git?rev=c57f908464df6634eba829e8267f9c5330b3a4b4#c57f908464df6634eba829e8267f9c5330b3a4b4"
 dependencies = [
  "rustbinary",
  "serde",

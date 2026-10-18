@@ -32,27 +32,6 @@ jobs:
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
           persist-credentials: false
-      - name: Checkout Hyphen consensus tree
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          repository: HyphenTeam/Hyphen
-          path: .hyphen-base
-          persist-credentials: false
-      - name: Materialize sibling consensus crates
-        shell: pwsh
-        run: |
-          Copy-Item .hyphen-base/Cargo.toml ../Cargo.toml -Force
-          Copy-Item .hyphen-base/LICENSE ../LICENSE -Force
-          if (Test-Path ../src) { Remove-Item ../src -Recurse -Force }
-          Copy-Item .hyphen-base/src ../src -Recurse
-          if (Test-Path ../crates) { Remove-Item ../crates -Recurse -Force }
-          Copy-Item .hyphen-base/crates ../crates -Recurse
-      - name: Record consensus revision
-        id: consensus
-        shell: pwsh
-        run: |
-          $commit = git -C .hyphen-base rev-parse HEAD
-          "commit=$commit" >> $env:GITHUB_OUTPUT
       - run: rustup toolchain install 1.97.0 --profile minimal
       - run: rustup default 1.97.0
       - name: Build and package
@@ -61,30 +40,54 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $env:CARGO_PROFILE_RELEASE_DEBUG = '1'
           cargo build --release --locked
-          $stage=Join-Path 'target/package' '${{ matrix.artifact }}'
+          $stage = Join-Path 'target/package' '${{ matrix.artifact }}'
           New-Item -ItemType Directory -Force $stage | Out-Null
           Copy-Item (Join-Path target/release '${{ matrix.executable }}') $stage
           Copy-Item README.md, README_CN.md, LICENSE $stage
-          Get-ChildItem target/release -Filter '*.pdb' -ErrorAction SilentlyContinue | Copy-Item -Destination $stage
-          @('project=HyphenPool','commit=${{ github.event.workflow_run.head_sha }}',"consensus_commit=${{ steps.consensus.outputs.commit }}","rustc=$(rustc --version)","cargo=$(cargo --version)",'profile=release','debug=line-tables') |
-            Set-Content (Join-Path $stage 'BUILD-INFO.txt') -Encoding utf8
+          Get-ChildItem target/release -Filter '*.pdb' -ErrorAction SilentlyContinue |
+            Copy-Item -Destination $stage
+          $consensus = (Select-String -Path Cargo.toml -Pattern 'rev = "([0-9a-f]{40})"' |
+            Select-Object -First 1).Matches.Groups[1].Value
+          if (-not $consensus) { throw 'pinned Hyphen revision not found in Cargo.toml' }
+          @(
+            'project=HyphenPool'
+            'commit=${{ github.event.workflow_run.head_sha }}'
+            "consensus_commit=$consensus"
+            "rustc=$(rustc --version)"
+            "cargo=$(cargo --version)"
+            'profile=release'
+            'debug=line-tables'
+          ) | Set-Content (Join-Path $stage 'BUILD-INFO.txt') -Encoding utf8
           New-Item -ItemType Directory -Force dist | Out-Null
-          if ($IsWindows) { $archive="dist/${{ matrix.artifact }}.zip"; Compress-Archive -Path "$stage/*" -DestinationPath $archive }
-          else { $archive="dist/${{ matrix.artifact }}.tar.gz"; tar -czf $archive -C target/package '${{ matrix.artifact }}' }
-          $name=Split-Path $archive -Leaf; $hashOutput = & cargo run --quiet --locked --example blake3-file -- $archive 2>&1
+          if ($IsWindows) {
+            $archive = Join-Path dist '${{ matrix.artifact }}.zip'
+            Compress-Archive -Path "$stage/*" -DestinationPath $archive
+          } else {
+            $archive = Join-Path dist '${{ matrix.artifact }}.tar.gz'
+            tar -czf $archive -C target/package '${{ matrix.artifact }}'
+          }
+          $name = Split-Path $archive -Leaf
+          $hashOutput = & cargo run --quiet --locked --example blake3-file -- $archive 2>&1
           if ($LASTEXITCODE -ne 0) { throw "BLAKE3 hashing failed: $($hashOutput | Out-String)" }
           $hash = ($hashOutput | Where-Object { "$_".Trim() } | Select-Object -Last 1).ToString().Trim()
           if ($hash -notmatch '^[0-9a-f]{64}$') { throw "unexpected BLAKE3 output: $hash" }
           "$hash  $name" | Set-Content "$archive.blake3" -Encoding ascii
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with: { name: "${{ matrix.artifact }}", path: "dist/*", if-no-files-found: error, retention-days: 14 }
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
   publish:
     needs: build
     runs-on: ubuntu-24.04
-    permissions: { contents: write }
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with: { path: dist, merge-multiple: true }
+        with:
+          path: dist
+          merge-multiple: true
       - name: Publish prerelease
         env:
           GH_TOKEN: ${{ github.token }}
@@ -94,6 +97,6 @@ jobs:
           ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
         shell: pwsh
         run: |
-          $tag="build-$env:RUN.$env:ATTEMPT-$($env:SHA.Substring(0,12))"
-          $assets=(Get-ChildItem dist -File).FullName
+          $tag = "build-$env:RUN.$env:ATTEMPT-$($env:SHA.Substring(0,12))"
+          $assets = (Get-ChildItem dist -File).FullName
           gh release create $tag @assets --target $env:SHA --title "Hyphen Pool $tag" --prerelease --generate-notes --notes "Automated commit-bound build. Verify the matching BLAKE3 file."

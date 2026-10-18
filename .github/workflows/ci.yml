@@ -18,21 +18,6 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-      - name: Checkout Hyphen consensus tree
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          repository: HyphenTeam/Hyphen
-          path: .hyphen-base
-          persist-credentials: false
-      - name: Materialize sibling consensus crates
-        shell: pwsh
-        run: |
-          Copy-Item .hyphen-base/Cargo.toml ../Cargo.toml -Force
-          Copy-Item .hyphen-base/LICENSE ../LICENSE -Force
-          if (Test-Path ../src) { Remove-Item ../src -Recurse -Force }
-          Copy-Item .hyphen-base/src ../src -Recurse
-          if (Test-Path ../crates) { Remove-Item ../crates -Recurse -Force }
-          Copy-Item .hyphen-base/crates ../crates -Recurse
       - name: Install pinned Rust toolchain
         run: |
           rustup toolchain install 1.97.0 --profile minimal --component clippy,rustfmt
@@ -47,21 +32,6 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-      - name: Checkout Hyphen consensus tree
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          repository: HyphenTeam/Hyphen
-          path: .hyphen-base
-          persist-credentials: false
-      - name: Materialize sibling consensus crates
-        shell: pwsh
-        run: |
-          Copy-Item .hyphen-base/Cargo.toml ../Cargo.toml -Force
-          Copy-Item .hyphen-base/LICENSE ../LICENSE -Force
-          if (Test-Path ../src) { Remove-Item ../src -Recurse -Force }
-          Copy-Item .hyphen-base/src ../src -Recurse
-          if (Test-Path ../crates) { Remove-Item ../crates -Recurse -Force }
-          Copy-Item .hyphen-base/crates ../crates -Recurse
       - run: rustup toolchain install 1.97.0 --profile minimal
       - run: rustup default 1.97.0
       - run: cargo build --release --locked

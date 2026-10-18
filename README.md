@@ -6,12 +6,12 @@ jobs to miners, verifies single-use Cunningham witness chains itself, keeps
 durable accounting, and drives payouts through Hyphen Wallet's payout agent.
 
 Consensus types, hashing, the wire profile, and the node protocol are not copied
-here. `hyphen-core`, `hyphen-crypto`, `hyphen-pow`, and `hyphen-transport` are
-consumed from the sibling `crates/` tree of `HyphenTeam/Hyphen`; CI and the
-release workflow materialize `../Cargo.toml`, `../crates` and `../LICENSE`
-before building. The pool derives the chain identity from its configuration
-instead of pinning literals. A protocol change is tested in both trees from one
-checkout, then released with the base commit recorded in the archive metadata.
+here. `hyphen-core`, `hyphen-crypto`, `hyphen-pow`, `hyphen-neural`, and
+`hyphen-transport` are consumed from the public Hyphen revision
+`c57f908464df6634eba829e8267f9c5330b3a4b4` pinned in `Cargo.toml` and
+`Cargo.lock`. There is no path dependency on a base-chain checkout: CI builds
+this repository from a clean clone. A protocol change is a coordinated revision
+bump followed by the compatibility checks below.
 
 ## Share semantics
 

@@ -16,11 +16,11 @@ path = "src/bin/pool_server.rs"
 async-trait = "0.1.91"
 clap = { version = "4.6.7", features = ["derive"] }
 courierust = "1.0.9"
-hyphen-core = { path = "../crates/hyphen-core" }
-hyphen-crypto = { path = "../crates/hyphen-crypto" }
-hyphen-pow = { path = "../crates/hyphen-pow" }
-hyphen-neural = { path = "../crates/hyphen-neural" }
-hyphen-transport = { path = "../crates/hyphen-transport" }
+hyphen-core = { git = "https://github.com/HyphenTeam/Hyphen.git", rev = "c57f908464df6634eba829e8267f9c5330b3a4b4" }
+hyphen-crypto = { git = "https://github.com/HyphenTeam/Hyphen.git", rev = "c57f908464df6634eba829e8267f9c5330b3a4b4" }
+hyphen-pow = { git = "https://github.com/HyphenTeam/Hyphen.git", rev = "c57f908464df6634eba829e8267f9c5330b3a4b4" }
+hyphen-neural = { git = "https://github.com/HyphenTeam/Hyphen.git", rev = "c57f908464df6634eba829e8267f9c5330b3a4b4" }
+hyphen-transport = { git = "https://github.com/HyphenTeam/Hyphen.git", rev = "c57f908464df6634eba829e8267f9c5330b3a4b4" }
 rustbinary = { version = "0.1.8", features = ["derive"] }
 parking_lot = "0.12"
 prost = "0.14.4"
