@@ -43,6 +43,8 @@ jobs:
         run: |
           Copy-Item .hyphen-base/Cargo.toml ../Cargo.toml -Force
           Copy-Item .hyphen-base/LICENSE ../LICENSE -Force
+          if (Test-Path ../src) { Remove-Item ../src -Recurse -Force }
+          Copy-Item .hyphen-base/src ../src -Recurse
           if (Test-Path ../crates) { Remove-Item ../crates -Recurse -Force }
           Copy-Item .hyphen-base/crates ../crates -Recurse
       - name: Record consensus revision
