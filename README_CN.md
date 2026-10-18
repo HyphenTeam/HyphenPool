@@ -47,14 +47,34 @@ SOLO、PROP、PPS、PPLNS、PPS+、FPPS 均保留。对某次提交，credited �
 
 ## 构建与运行
 
-```powershell
+```bash
 cargo build --release --locked
 cargo test --locked
 cargo clippy --all-targets --locked -- -D warnings
 
-.\target\release\hyphen-pool-server.exe --network devnet --node 127.0.0.1:3350 `
-    --bind 0.0.0.0:3340 --pool-state-dir pool_state
+# 一次性生成矿池身份；默认拒绝覆盖，--force 用于轮换密钥
+./target/release/hyphen-pool-server keygen --output pool.key
+
+./target/release/hyphen-pool-server \
+    --network devnet \
+    --node 127.0.0.1:3350 \
+    --bind 0.0.0.0:3340 \
+    --api-bind 0.0.0.0:8081 \
+    --payout-mode solo \
+    --share-difficulty 10 \
+    --key-file pool.key \
+    --pool-state-dir pool_state
 ```
+
+Windows 下把可执行文件换成 `.\target\release\hyphen-pool-server.exe`，续行符改用反引号。
+
+`--key-file` 必须存在且恰好为 32 字节。`keygen` 会自动创建缺失的父目录，在 Unix 上以
+0600 权限写入；若已有密钥可被同组或其他用户读取，服务启动时会告警。省略 `--key-file`
+会生成临时密钥，矿池身份每次重启都会变化，只适合一次性 devnet 测试。
+
+`--payout-mode solo` 不需要付款代理：每个矿工授权地址直接接收 coinbase。`--pool-wallet`
+可选，solo 模式下默认使用矿池密钥的公钥。`pool_state` 会自动创建并保存结算账本。节点必须
+在 `--node` 指定的地址暴露 Template Provider（默认 `127.0.0.1:3350`）。
 
 ## 结算 API
 

@@ -51,7 +51,8 @@ struct Cli {
     #[arg(long, default_value = "hyphen-pool/0.1")]
     pool_id: String,
 
-    /// Path to 32-byte Ed25519 secret key file
+    /// Path to a 32-byte Ed25519 secret key file. Generate it with `keygen`.
+    /// Empty generates an ephemeral key, which changes the pool identity on restart.
     #[arg(long, default_value = "")]
     key_file: String,
 
@@ -129,6 +130,9 @@ enum Commands {
         /// Output file path for the 32-byte secret key
         #[arg(long, default_value = "pool.key")]
         output: String,
+        /// Replace an existing key file. This changes the pool identity.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -142,11 +146,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cli = Cli::parse();
 
-    if let Some(Commands::Keygen { output }) = &cli.command {
+    if let Some(Commands::Keygen { output, force }) = &cli.command {
+        let path = PathBuf::from(output);
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|error| {
+                    format!(
+                        "cannot create key directory '{}': {error}",
+                        parent.display()
+                    )
+                })?;
+            }
+        }
         let sk = SecretKey::generate();
-        std::fs::write(output, sk.0)?;
+        write_secret_key(&path, &sk.0, *force)?;
         println!("Key generated successfully:");
-        println!("  Secret key file : {output}");
+        println!("  Secret key file : {}", path.display());
         println!("  Public key (hex): {}", sk.public_key());
         println!("\nKeep the secret key file safe. Never share it.");
         return Ok(());
@@ -201,9 +216,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("Generated ephemeral pool key: {}", sk.public_key());
         sk
     } else {
-        let data = std::fs::read(&cli.key_file)?;
+        warn_if_key_file_is_shared(&cli.key_file);
+        let data = std::fs::read(&cli.key_file).map_err(|error| {
+            format!(
+                "cannot read --key-file '{}': {error}; create it with `hyphen-pool-server keygen --output {}`",
+                cli.key_file, cli.key_file
+            )
+        })?;
         if data.len() != 32 {
-            return Err("key file must be exactly 32 bytes".into());
+            return Err(format!(
+                "--key-file '{}' must contain exactly 32 bytes, found {}",
+                cli.key_file,
+                data.len()
+            )
+            .into());
         }
         let mut bytes = [0u8; 32];
         bytes.copy_from_slice(&data);
@@ -367,4 +393,61 @@ async fn start_pool<T: TemplateProvider + Send + Sync + 'static>(
 /// An empty flag value means "not given", so the CLI keeps plain defaults.
 fn tls_arg(value: &str) -> Option<&str> {
     (!value.is_empty()).then_some(value)
+}
+
+fn write_secret_key(
+    path: &std::path::Path,
+    secret: &[u8; 32],
+    overwrite: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true);
+    if overwrite {
+        options.create(true).truncate(true);
+    } else {
+        options.create_new(true);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).map_err(|error| {
+        let hint = if error.kind() == std::io::ErrorKind::AlreadyExists {
+            "; refusing to replace an existing pool key (pass --force only when rotating it)"
+        } else {
+            ""
+        };
+        format!("cannot create key file '{}': {error}{hint}", path.display())
+    })?;
+    use std::io::Write;
+    let written = file.write_all(secret).and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(error) = written {
+        let _ = std::fs::remove_file(path);
+        return Err(format!("cannot write key file '{}': {error}", path.display()).into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+fn warn_if_key_file_is_shared(path: &str) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = std::fs::metadata(path) {
+            if metadata.permissions().mode() & 0o077 != 0 {
+                tracing::warn!(
+                    "pool key file '{}' is accessible by group or other; run chmod 600 on it",
+                    path
+                );
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }

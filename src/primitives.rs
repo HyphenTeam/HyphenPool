@@ -1,5 +1,6 @@
 //! Canonical re-exports. The pool owns policy, not consensus: every item below
-//! is the exact definition the node executes, reached through path deps.
+//! is the exact definition the node executes, reached through the pinned
+//! consensus revision.
 #![allow(unused_imports)]
 
 pub use hyphen_core::{

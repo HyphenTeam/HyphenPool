@@ -62,14 +62,39 @@ SOLO, PROP, PPS, PPLNS, PPS+ and FPPS remain available. For a submission with
 
 ## Build and run
 
-```powershell
+```bash
 cargo build --release --locked
 cargo test --locked
 cargo clippy --all-targets --locked -- -D warnings
 
-.\target\release\hyphen-pool-server.exe --network devnet --node 127.0.0.1:3350 `
-    --bind 0.0.0.0:3340 --pool-state-dir pool_state
+# One-time pool identity. Refuses to overwrite; --force rotates the key.
+./target/release/hyphen-pool-server keygen --output pool.key
+
+./target/release/hyphen-pool-server \
+    --network devnet \
+    --node 127.0.0.1:3350 \
+    --bind 0.0.0.0:3340 \
+    --api-bind 0.0.0.0:8081 \
+    --payout-mode solo \
+    --share-difficulty 10 \
+    --key-file pool.key \
+    --pool-state-dir pool_state
 ```
+
+On Windows use `.\target\release\hyphen-pool-server.exe` and a backtick for line
+continuation.
+
+`--key-file` must exist and contain exactly 32 bytes. `keygen` creates missing
+parent directories and writes the key with mode 0600 on Unix; the server warns
+if an existing key is readable by group or other. Omitting `--key-file` makes
+the server generate an ephemeral key, so the pool identity changes on every
+restart — that is only acceptable for a throwaway devnet.
+
+`--payout-mode solo` needs no payout agent: each miner's authorized address
+receives the coinbase. `--pool-wallet` is optional and defaults to the pool
+key's public key in solo mode. `pool_state` is created automatically and holds
+the accounting ledger. The node must expose its Template Provider on `--node`
+(`127.0.0.1:3350` by default).
 
 ## Accounting API
 
