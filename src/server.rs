@@ -30,6 +30,14 @@ const VARDIFF_MAX: u64 = hyphen_pow::vms::MAX_WITNESSES_PER_BLOCK;
 const VARDIFF_WINDOW: usize = 24;
 /// Retarget check interval (after this many shares)
 const VARDIFF_RETARGET_SHARES: usize = 6;
+
+/// Minimum wall-clock gap between decisions. Shares mined under the previous
+/// threshold carry no information about the next one.
+const VARDIFF_MIN_RETARGET_MS: u64 = 20_000;
+
+/// A change smaller than this keeps the threshold and only consumes the
+/// sample window, so the controller settles instead of dithering.
+const VARDIFF_SIGNIFICANT_CHANGE: f64 = 0.25;
 /// Initial low difficulty for new miners (ramps up quickly)
 const VARDIFF_INITIAL: u64 = 100;
 
@@ -72,6 +80,10 @@ struct MinerSession {
 struct VarDiffState {
     current_difficulty: u64,
     share_timestamps: VecDeque<u64>,
+    /// Wall-clock time of the last decision. Samples are one difficulty's
+    /// worth of shares; deciding again on a mixed window is what makes the
+    /// controller oscillate.
+    last_retarget_ms: u64,
 }
 
 impl VarDiffState {
@@ -79,6 +91,7 @@ impl VarDiffState {
         Self {
             current_difficulty: initial_difficulty,
             share_timestamps: VecDeque::with_capacity(VARDIFF_WINDOW + 1),
+            last_retarget_ms: 0,
         }
     }
 
@@ -108,11 +121,22 @@ impl VarDiffState {
         total_lifetime_shares: u64,
         estimated_target: u64,
     ) -> Option<u64> {
+        let now_ms = hyphen_core::timestamp::ntp_adjusted_timestamp_ms();
+        // The warmup ramp is a value function of the share count, but issuing a
+        // new threshold on every share re-sends a job per share and starves the
+        // miner of the one thing it needs: a stable job to finish.
+        if self.last_retarget_ms != 0
+            && now_ms.saturating_sub(self.last_retarget_ms) < VARDIFF_MIN_RETARGET_MS
+        {
+            return None;
+        }
+
         // During warmup, always return the exponentially ramped difficulty
         if total_lifetime_shares < GTM_WARMUP_SHARES {
             let warmup_diff = Self::warmup_difficulty(total_lifetime_shares, estimated_target);
             if warmup_diff != self.current_difficulty {
                 self.current_difficulty = warmup_diff;
+                self.last_retarget_ms = now_ms;
                 return Some(warmup_diff);
             }
             return None;
@@ -141,34 +165,42 @@ impl VarDiffState {
             return None;
         }
 
-        let oldest = *self.share_timestamps.front()?;
-        let newest = *self.share_timestamps.back()?;
-        let elapsed_secs = (newest.saturating_sub(oldest)) as f64 / 1000.0;
-        if elapsed_secs < 1.0 {
-            // Too fast – double difficulty
-            let new_diff = (self.current_difficulty * 2).clamp(VARDIFF_MIN, VARDIFF_MAX);
-            if new_diff != self.current_difficulty {
-                self.current_difficulty = new_diff;
-                return Some(new_diff);
-            }
+        // A retarget moves the threshold. Samples collected under the old
+        // threshold say nothing about the new one, and deciding again
+        // immediately is what drove the controller into a
+        // 200 → 29 → 45 → 43 oscillation that starved every miner of block
+        // candidates.
+        if now_ms.saturating_sub(self.last_retarget_ms) < VARDIFF_MIN_RETARGET_MS {
             return None;
         }
 
-        let actual_rate = elapsed_secs / (total_shares.saturating_sub(1)) as f64;
-        let ratio = actual_rate / VARDIFF_TARGET_SECS;
+        let oldest = *self.share_timestamps.front()?;
+        let newest = *self.share_timestamps.back()?;
+        let elapsed_secs = (newest.saturating_sub(oldest)) as f64 / 1000.0;
 
-        // Clamp ratio to avoid wild swings (max 4x change per retarget)
-        let clamped = ratio.clamp(0.25, 4.0);
+        let proposed = if elapsed_secs < 1.0 {
+            // Too fast to measure: double, still bounded by the hard ceiling.
+            self.current_difficulty.saturating_mul(2)
+        } else {
+            let actual_rate = elapsed_secs / (total_shares.saturating_sub(1)) as f64;
+            let ratio = actual_rate / VARDIFF_TARGET_SECS;
+            // Bounded factor per decision so one burst cannot swing the pool.
+            let clamped = ratio.clamp(0.5, 2.0);
+            (self.current_difficulty as f64 / clamped) as u64
+        };
+        let proposed = proposed.clamp(VARDIFF_MIN, VARDIFF_MAX);
 
-        let new_diff =
-            ((self.current_difficulty as f64 / clamped) as u64).clamp(VARDIFF_MIN, VARDIFF_MAX);
+        // Every decision consumes the window, whether or not it changes the
+        // threshold: the next one must be measured under the threshold that is
+        // active when its shares were mined.
+        self.share_timestamps.clear();
+        self.last_retarget_ms = now_ms;
 
-        // Only notify if change is significant (> 10%)
-        let change_pct = (new_diff as f64 - self.current_difficulty as f64).abs()
-            / self.current_difficulty as f64;
-        if change_pct > 0.10 {
-            self.current_difficulty = new_diff;
-            Some(new_diff)
+        let change_pct = (proposed as f64 - self.current_difficulty as f64).abs()
+            / self.current_difficulty.max(1) as f64;
+        if change_pct > VARDIFF_SIGNIFICANT_CHANGE {
+            self.current_difficulty = proposed;
+            Some(proposed)
         } else {
             None
         }
@@ -798,6 +830,21 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                                 let new_diff = {
                                     let mut miners = self.miners.write();
                                     miners.get_mut(&miner_pk).and_then(|session| {
+                                        // A report measured over an idle window
+                                        // says nothing about sustainable rate.
+                                        if report.operations_per_second == 0 {
+                                            return None;
+                                        }
+                                        // Same decision gate as the share-driven
+                                        // controller: one threshold change per
+                                        // interval, so the pool is not re-issuing
+                                        // jobs faster than miners can mine them.
+                                        let now_ms = hyphen_core::timestamp::ntp_adjusted_timestamp_ms();
+                                        if now_ms.saturating_sub(session.vardiff.last_retarget_ms)
+                                            < VARDIFF_MIN_RETARGET_MS
+                                        {
+                                            return None;
+                                        }
                                         let recommended = Self::recommended_share_difficulty(&self.cfg,
                                             report.operations_per_second,
                                             session.thread_count,
@@ -805,7 +852,7 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                                         let current = session.vardiff.current_difficulty.max(1);
                                         let change_pct = (recommended as f64 - current as f64).abs()
                                             / current as f64;
-                                        if change_pct >= 0.15 {
+                                        if change_pct >= VARDIFF_SIGNIFICANT_CHANGE {
                                             let now = std::time::Instant::now();
                                             if now.duration_since(session.floor_set_at).as_secs()
                                                 >= VARDIFF_GRACE_WINDOW_SECS
@@ -818,6 +865,7 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                                             session.floor_set_at = now;
                                             session.vardiff.current_difficulty = recommended;
                                             session.vardiff.share_timestamps.clear();
+                                            session.vardiff.last_retarget_ms = now_ms;
                                             Some(recommended)
                                         } else {
                                             None
