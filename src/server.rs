@@ -318,7 +318,15 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
     ) -> Result<JobTemplate, PoolError> {
         let mut header = job.header.clone();
         header.miner_pubkey = miner_pubkey;
-        let share_difficulty = share_difficulty.clamp(1, header.difficulty);
+        // Neural work has no partial credit, so every job is all-or-nothing:
+        // advertising the block threshold as the share difficulty keeps the
+        // miner's view of the job coherent instead of suggesting variance that
+        // the accounting cannot honour.
+        let share_difficulty = if self.cfg.feature_enabled(hyphen_core::FEATURE_NEURAL_WORK) {
+            header.difficulty
+        } else {
+            share_difficulty.clamp(1, header.difficulty)
+        };
         let reward_spend_public = self.accounting.reward_recipient_for_wallet(wallet_address);
         let reward_view_public = self
             .accounting
@@ -1001,8 +1009,16 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
             }
         };
 
-        let credit_at = effective_share_diff.clamp(1, effective_header.difficulty);
-        if submission.chain_length != job.chain_length as u64 {
+        let neural = self.cfg.feature_enabled(hyphen_core::FEATURE_NEURAL_WORK);
+        // Neural work has no verifiable partial result, so every accepted
+        // submission is a complete block candidate and `credit_at` is the block
+        // difficulty by definition.
+        let credit_at = if neural {
+            effective_header.difficulty.max(1)
+        } else {
+            effective_share_diff.clamp(1, effective_header.difficulty)
+        };
+        if !neural && submission.chain_length != job.chain_length as u64 {
             return SubmitResult {
                 accepted: false,
                 error: format!(
@@ -1013,29 +1029,38 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                 block_hash: Vec::new(),
             };
         }
-        {
+        let verdict = if neural {
+            crate::share::verify_neural_share(
+                &effective_header,
+                &job.header.prev_hash,
+                miner_pk,
+                &submission.witnesses,
+            )
+        } else {
+            // Only another miner's witnesses are refused. The submitting miner
+            // is allowed to extend a list it already submitted as a credit
+            // share, which is how a block candidate is built.
             let claimed = self.claimed_witnesses.read();
-            if let Some(duplicate) = submission
-                .witnesses
-                .iter()
-                .find(|witness| claimed.contains(**witness))
-            {
+            if let Some(duplicate) = claimed.claimed_by_other(miner_pk, &submission.witnesses) {
                 return SubmitResult {
                     accepted: false,
-                    error: format!("witness {duplicate} was already claimed on this pool"),
+                    error: format!(
+                        "witness {duplicate} was already claimed by another miner on this pool"
+                    ),
                     block_found: false,
                     block_hash: Vec::new(),
                 };
             }
-        }
-        let verdict = verify_share(
-            &effective_header,
-            job.chain_length,
-            &job.parent_work_commitment,
-            &submission.witnesses,
-            effective_header.difficulty,
-            credit_at,
-        );
+            drop(claimed);
+            verify_share(
+                &effective_header,
+                job.chain_length,
+                &job.parent_work_commitment,
+                &submission.witnesses,
+                effective_header.difficulty,
+                credit_at,
+            )
+        };
 
         match verdict {
             ShareVerdict::BlockFound { commitment } => {
@@ -1100,7 +1125,11 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                         block_hash: Vec::new(),
                     };
                 }
-                self.claimed_witnesses.write().claim(&submission.witnesses);
+                if !neural {
+                    self.claimed_witnesses
+                        .write()
+                        .claim(miner_pk, &submission.witnesses);
+                }
 
                 let wallet_hex = {
                     let miners = self.miners.read();
@@ -1242,11 +1271,22 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                         block_hash: Vec::new(),
                     };
                 }
-                let credited = self.claimed_witnesses.write().claim(&submission.witnesses);
+                let credited = self
+                    .claimed_witnesses
+                    .write()
+                    .claim(miner_pk, &submission.witnesses);
+                if credited == 0 {
+                    return SubmitResult {
+                        accepted: false,
+                        error: "submission repeats witnesses this pool already credited".into(),
+                        block_found: false,
+                        block_hash: Vec::new(),
+                    };
+                }
                 self.accounting.record_valid_share(
                     *miner_pk,
                     wallet_address,
-                    credited.max(1),
+                    credited,
                     effective_header.difficulty,
                     effective_header.reward,
                     effective_header.total_fee,

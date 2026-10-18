@@ -19,7 +19,7 @@ coordinated revision bump followed by the compatibility checks below.
 A share is a witness list, not a nonce. For every submission the pool:
 
 1. Rejects a chain length that differs from the job's.
-2. Rejects any witness already claimed on this pool.
+2. Rejects a witness another miner has already claimed on this pool.
 3. Runs the node's own predicate (`verify_witnesses`) over the list.
 4. Recomputes `witness_commitment(parent_commitment, height, witnesses)` and
    compares it with the commitment the miner submitted.
@@ -29,10 +29,16 @@ exact header the miner signed, verifies the miner authorization inside it,
 assembles the block with `pow_witnesses`, and submits it. A shorter list with at
 least `share_difficulty` witnesses earns credit.
 
-Credit is granted per witness the pool has not paid for before, so submitting a
-prefix and then the full list cannot be double counted, and a replayed list earns
-nothing. The node enforces single use chain-wide with its own sparse Merkle set;
-the pool mirrors the rule so a replay is refused before the node ever sees it.
+The claim set records *who* claimed each witness. The miner's documented flow is
+to submit a credit share and then extend the same list to `difficulty`, so a
+miner must be allowed to reuse its own credited witnesses; that is the only way
+a block candidate can exist while `share_difficulty` is below the block
+difficulty. Another miner submitting the same list is refused, and a credit
+submission that contains no new witness is refused outright instead of earning
+credit. Credit is granted per witness the pool has not paid for before, so a
+replayed list earns nothing. The node enforces single use chain-wide with its
+own sparse Merkle set; the pool mirrors the rule so a replay is refused before
+the node ever sees it.
 
 `share_difficulty` is therefore a witness count, not an iteration count. The
 persisted ledger field keeps its old name for compatibility.

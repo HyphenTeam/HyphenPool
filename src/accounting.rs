@@ -339,7 +339,6 @@ pub struct PoolAccounting {
     state: RwLock<AccountingState>,
     state_path: Option<PathBuf>,
     network_magic: [u8; 4],
-    /// Maps spend_public → view_public for all registered miners and the pool wallet.
     view_keys: RwLock<HashMap<[u8; 32], [u8; 32]>>,
 }
 
@@ -405,7 +404,9 @@ impl PoolAccounting {
             }
             let expected_version = match network_magic {
                 [0x48, 0x59, 0x50, 0x4e] => 0x01,
-                [0x48, 0x59, 0x54, 0x53] | [0x48, 0x59, 0x44, 0x56] => 0x02,
+                [0x48, 0x59, 0x54, 0x53] | [0x48, 0x59, 0x44, 0x56] | [0x48, 0x59, 0x4e, 0x4e] => {
+                    0x02
+                }
                 _ => return Err("unknown Hyphen network magic".into()),
             };
             if payload[0] != expected_version {
@@ -1374,7 +1375,7 @@ fn encode_wallet_address(
     }
     let version = match network_magic {
         [0x48, 0x59, 0x50, 0x4e] => 0x01,
-        [0x48, 0x59, 0x54, 0x53] | [0x48, 0x59, 0x44, 0x56] => 0x02,
+        [0x48, 0x59, 0x54, 0x53] | [0x48, 0x59, 0x44, 0x56] | [0x48, 0x59, 0x4e, 0x4e] => 0x02,
         _ => return Err(AccountingError::InvalidNetwork),
     };
     let mut payload = Vec::with_capacity(69);

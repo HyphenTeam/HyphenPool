@@ -236,8 +236,6 @@ impl ChainState {
     }
 
     pub fn accept_block(&self, block: &Block) -> Result<Hash256, String> {
-        // Hold write lock for the entire operation to prevent race conditions
-        // where two blocks at the same height are accepted concurrently.
         let mut tip_guard = self.tip.write();
         let tip = tip_guard.clone();
 
@@ -263,9 +261,6 @@ impl ChainState {
             return Err("timestamp must be after parent".into());
         }
 
-        // Witness validation mirrors the node: predicate first, then single use,
-        // then the chained commitment. Rejecting in that order keeps a malformed
-        // list from ever touching the claimed set.
         let count = block.pow_witnesses.len() as u64;
         if count != block.header.difficulty {
             return Err(format!(
@@ -322,7 +317,9 @@ impl ChainState {
             difficulty: block.header.difficulty,
             pow_commitment: block.header.pow_commitment,
         };
-        self.claimed_witnesses.write().claim(&block.pow_witnesses);
+        self.claimed_witnesses
+            .write()
+            .claim(&[0u8; 32], &block.pow_witnesses);
 
         {
             let mut history = self.history.write();

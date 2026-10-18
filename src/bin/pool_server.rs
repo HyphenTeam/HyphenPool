@@ -39,8 +39,12 @@ struct Cli {
     #[arg(long, default_value = "100")]
     share_difficulty: u64,
 
-    /// Network selection (mainnet | testnet | devnet)
-    #[arg(long, value_parser = ["mainnet", "testnet", "devnet"], default_value = "devnet")]
+    /// Network selection (mainnet | testnet | devnet | neural-devnet)
+    #[arg(
+        long,
+        value_parser = ["mainnet", "testnet", "devnet", "neural-devnet"],
+        default_value = "devnet"
+    )]
     network: String,
 
     /// Pool identifier
@@ -152,6 +156,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "mainnet" => ChainConfig::mainnet(),
         "testnet" => ChainConfig::testnet(),
         "devnet" => ChainConfig::devnet(),
+        "neural-devnet" => ChainConfig::neural_devnet(),
         _ => unreachable!("clap validates network"),
     };
 

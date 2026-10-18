@@ -376,8 +376,7 @@ dependencies = [
 
 [[package]]
 name = "hyphen-core"
-version = "0.1.0"
-source = "git+https://github.com/HyphenTeam/Hyphen.git?rev=576bc67d972d1156fbabb1ddf579104d5ff2ff88#576bc67d972d1156fbabb1ddf579104d5ff2ff88"
+version = "0.1.1"
 dependencies = [
  "hyphen-crypto",
  "hyphen-wire",
@@ -388,12 +387,12 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "tzcraft",
 ]
 
 [[package]]
 name = "hyphen-crypto"
-version = "0.1.0"
-source = "git+https://github.com/HyphenTeam/Hyphen.git?rev=576bc67d972d1156fbabb1ddf579104d5ff2ff88#576bc67d972d1156fbabb1ddf579104d5ff2ff88"
+version = "0.1.1"
 dependencies = [
  "blake3",
  "curve25519-dalek",
@@ -408,6 +407,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyphen-neural"
+version = "0.1.1"
+dependencies = [
+ "clap",
+]
+
+[[package]]
 name = "hyphen-pool"
 version = "0.1.1"
 dependencies = [
@@ -416,6 +422,7 @@ dependencies = [
  "courierust",
  "hyphen-core",
  "hyphen-crypto",
+ "hyphen-neural",
  "hyphen-pow",
  "hyphen-transport",
  "parking_lot",
@@ -432,24 +439,16 @@ dependencies = [
 
 [[package]]
 name = "hyphen-pow"
-version = "0.1.0"
-source = "git+https://github.com/HyphenTeam/Hyphen.git?rev=576bc67d972d1156fbabb1ddf579104d5ff2ff88#576bc67d972d1156fbabb1ddf579104d5ff2ff88"
+version = "0.1.1"
 dependencies = [
  "blake3",
  "hyphen-core",
  "hyphen-crypto",
- "parking_lot",
- "rand",
- "rand_chacha",
- "rustbinary",
- "serde",
- "thiserror",
 ]
 
 [[package]]
 name = "hyphen-transport"
-version = "0.1.0"
-source = "git+https://github.com/HyphenTeam/Hyphen.git?rev=576bc67d972d1156fbabb1ddf579104d5ff2ff88#576bc67d972d1156fbabb1ddf579104d5ff2ff88"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "hyphen-crypto",
@@ -461,8 +460,7 @@ dependencies = [
 
 [[package]]
 name = "hyphen-wire"
-version = "0.1.0"
-source = "git+https://github.com/HyphenTeam/Hyphen.git?rev=576bc67d972d1156fbabb1ddf579104d5ff2ff88#576bc67d972d1156fbabb1ddf579104d5ff2ff88"
+version = "0.1.1"
 dependencies = [
  "rustbinary",
  "serde",
@@ -629,15 +627,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
-name = "ppv-lite86"
-version = "0.2.21"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "85eae3c4ed2f50dcfe72643da4befc30deadb458a9b590d720cde2f2b1e97da9"
-dependencies = [
- "zerocopy",
-]
-
-[[package]]
 name = "proc-macro2"
 version = "1.0.107"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -692,16 +681,6 @@ checksum = "65c9fb96cbc91e3478eaae79a69fcd3f1ae4ad052e471fe6732fff548984b4af"
 dependencies = [
  "chacha20",
  "getrandom 0.4.3",
- "rand_core 0.10.1",
-]
-
-[[package]]
-name = "rand_chacha"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3e6af7f3e25ded52c41df4e0b1af2d047e45896c2f3281792ed68a1c243daedb"
-dependencies = [
- "ppv-lite86",
  "rand_core 0.10.1",
 ]
 
@@ -1061,6 +1040,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
+name = "tzcraft"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cec9458ae44ab93f5dfbbea23325c6dfef65cf1723358894785721e363e41635"
+
+[[package]]
 name = "unicode-ident"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1097,26 +1082,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
 dependencies = [
  "windows-link",
-]
-
-[[package]]
-name = "zerocopy"
-version = "0.8.63"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e5fe1f8f1b06191a00962174c61aa5005e0bb391a6d80d07e24d115c01a92ed8"
-dependencies = [
- "zerocopy-derive",
-]
-
-[[package]]
-name = "zerocopy-derive"
-version = "0.8.63"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "863ad3ac83293fb4d740aedbfdc9240dd8d1a50c1099acd76ce80ce7c7230c7f"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
 ]
 
 [[package]]
