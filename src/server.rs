@@ -315,7 +315,7 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
         wallet_address: [u8; 32],
         miner_pubkey: [u8; 32],
         share_difficulty: u64,
-    ) -> JobTemplate {
+    ) -> Result<JobTemplate, PoolError> {
         let mut header = job.header.clone();
         header.miner_pubkey = miner_pubkey;
         let share_difficulty = share_difficulty.clamp(1, header.difficulty);
@@ -326,10 +326,10 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
             .unwrap_or([0u8; 32]);
         let header_data = crate::wire_config(crate::DEFAULT_WIRE_BYTES)
             .serialize(&header)
-            .expect("header serialisation");
+            .map_err(|error| PoolError::Internal(format!("header serialisation: {error}")))?;
         let identity = ChainIdentity::of(&self.cfg);
 
-        JobTemplate {
+        Ok(JobTemplate {
             job_id: job.job_id.to_vec(),
             header_data,
             height: header.height,
@@ -345,7 +345,7 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
             reward_spend_public: reward_spend_public.to_vec(),
             transactions: job.transactions.clone(),
             parent_work_commitment: job.parent_work_commitment.as_bytes().to_vec(),
-        }
+        })
     }
 
     fn is_expected_disconnect(error: &PoolError) -> bool {
@@ -660,7 +660,7 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
 
         if let Some(job) = current_job {
             let template =
-                self.build_job_template_for_miner(&job, true, wallet_addr, miner_pk, gtm_initial);
+                self.build_job_template_for_miner(&job, true, wallet_addr, miner_pk, gtm_initial)?;
             let job_env = PoolEnvelope::sign(MSG_JOB, template.encode_to_vec(), &self.pool_key);
             PoolCodec::write_envelope(&mut stream, &job_env).await?;
         }
@@ -765,7 +765,7 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                                             wallet,
                                             miner_pk,
                                             diff,
-                                        );
+                                        )?;
                                         let job_env = PoolEnvelope::sign(
                                             MSG_JOB,
                                             template.encode_to_vec(),
@@ -842,7 +842,7 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                                             wallet,
                                             miner_pk,
                                             diff,
-                                        );
+                                        )?;
                                         let job_env = PoolEnvelope::sign(
                                             MSG_JOB,
                                             template.encode_to_vec(),
@@ -871,7 +871,7 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                                     wallet,
                                     miner_pk,
                                     diff,
-                                );
+                                )?;
                                 let env = PoolEnvelope::sign(MSG_JOB, template.encode_to_vec(), &self.pool_key);
                                 PoolCodec::write_envelope(&mut stream, &env).await?;
                             }
