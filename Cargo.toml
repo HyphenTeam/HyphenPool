@@ -16,10 +16,12 @@ path = "src/bin/pool_server.rs"
 async-trait = "0.1.91"
 clap = { version = "4.6.7", features = ["derive"] }
 courierust = "1.0.9"
-hyphen-core = { path = "../crates/hyphen-core" }
-hyphen-crypto = { path = "../crates/hyphen-crypto" }
-hyphen-pow = { path = "../crates/hyphen-pow" }
-hyphen-transport = { path = "../crates/hyphen-transport" }
+# Hyphen protocol crates are consumed from a pinned public revision, never from
+# a local checkout: this repository's CI must build from a clean clone.
+hyphen-core = { git = "https://github.com/HyphenTeam/Hyphen.git", rev = "576bc67d972d1156fbabb1ddf579104d5ff2ff88" }
+hyphen-crypto = { git = "https://github.com/HyphenTeam/Hyphen.git", rev = "576bc67d972d1156fbabb1ddf579104d5ff2ff88" }
+hyphen-pow = { git = "https://github.com/HyphenTeam/Hyphen.git", rev = "576bc67d972d1156fbabb1ddf579104d5ff2ff88" }
+hyphen-transport = { git = "https://github.com/HyphenTeam/Hyphen.git", rev = "576bc67d972d1156fbabb1ddf579104d5ff2ff88" }
 rustbinary = { version = "0.1.8", features = ["derive"] }
 parking_lot = "0.12"
 prost = "0.14.4"

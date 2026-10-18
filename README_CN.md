@@ -5,7 +5,10 @@ Hyphen Pool 是 Hyphen 区块版本 5（PoUW v3）的独立矿池服务。它连
 账本，并通过 Hyphen Wallet 的 payout agent 执行付款。
 
 共识类型、哈希、wire 编码与节点协议在这里不再复制。hyphen-core、hyphen-crypto、
-hyphen-pow、hyphen-transport 以路径依赖引入，且矿池从配置派生链身份，而不是钉死字面量。
+hyphen-pow、hyphen-transport 通过 `Cargo.toml` 与 `Cargo.lock` 钉定的公开 Hyphen revision
+`576bc67d972d1156fbabb1ddf579104d5ff2ff88` 引入，且矿池从配置派生链身份，而不是钉死字面量。
+这里没有指向主链本地检出的路径依赖：CI 从干净克隆构建本仓库。协议变更意味着协同升级该
+revision，然后执行下文列出的兼容性检查。
 
 ## 份额语义
 
