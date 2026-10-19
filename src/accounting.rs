@@ -10,6 +10,9 @@ use thiserror::Error;
 use tracing::warn;
 
 const ACCOUNTING_STATE_MAGIC: &[u8; 16] = b"HyPoolAccountV1\0";
+
+/// Settled payout history kept in the ledger.
+const PAYOUT_HISTORY_LIMIT: usize = 512;
 type RecipientKey = ([u8; 32], [u8; 32]);
 type RecipientBalances = Vec<(String, u128)>;
 
@@ -856,6 +859,7 @@ impl PoolAccounting {
         }
         state.next_payout_sequence = next_sequence;
         state.payouts.push(record.clone());
+        Self::trim_payouts(&mut state.payouts);
         if let Err(error) = self.persist_state(&state) {
             *state = previous;
             return Err(error);
@@ -1230,6 +1234,28 @@ impl PoolAccounting {
 
         selected.reverse();
         selected
+    }
+
+    /// Drops the oldest settled payouts once the ledger exceeds its history
+    /// budget.
+    ///
+    /// A payout that is still `Reserved` or `Submitted` must stay addressable
+    /// for reconciliation after a restart, so only `Confirmed` records are
+    /// dropped. Without this the ledger grows for the lifetime of the pool and
+    /// every atomic save rewrites the whole file.
+    fn trim_payouts(payouts: &mut Vec<PayoutRecord>) {
+        if payouts.len() <= PAYOUT_HISTORY_LIMIT {
+            return;
+        }
+        let mut excess = payouts.len() - PAYOUT_HISTORY_LIMIT;
+        payouts.retain(|record| {
+            if excess > 0 && matches!(record.status, PayoutStatus::Confirmed { .. }) {
+                excess -= 1;
+                false
+            } else {
+                true
+            }
+        });
     }
 
     fn trim_share_window(shares: &mut Vec<ShareCredit>, block_difficulty: u64, factor: u32) {
