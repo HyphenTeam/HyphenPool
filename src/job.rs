@@ -1,9 +1,18 @@
 use parking_lot::RwLock;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 use tracing::info;
 
 use crate::primitives::{BlockHeader, Hash256};
 use crate::tp::BlockTemplate;
+
+/// How long one candidate may hold the right to submit a block for a job.
+///
+/// A submission is a request to the node; if the pool stalls, crashes or loses
+/// the node connection mid-flight, the claim must not outlive the attempt. Two
+/// minutes is far longer than a submit takes and short enough that a wedged pool
+/// recovers on its own.
+const BLOCK_SUBMISSION_LEASE: Duration = Duration::from_secs(120);
 
 #[derive(Clone)]
 pub struct ActiveJob {
@@ -24,7 +33,7 @@ pub struct JobManager {
     share_difficulty: u64,
     current_job: RwLock<Option<ActiveJob>>,
     jobs: RwLock<HashMap<[u8; 32], ActiveJob>>,
-    blocked_jobs: RwLock<HashSet<[u8; 32]>>,
+    blocked_jobs: RwLock<HashMap<[u8; 32], std::time::Instant>>,
 }
 
 impl JobManager {
@@ -33,7 +42,7 @@ impl JobManager {
             share_difficulty,
             current_job: RwLock::new(None),
             jobs: RwLock::new(HashMap::new()),
-            blocked_jobs: RwLock::new(HashSet::new()),
+            blocked_jobs: RwLock::new(HashMap::new()),
         }
     }
 
@@ -103,7 +112,7 @@ impl JobManager {
                     existing.header.height == job.header.height
                         && existing.header.prev_hash == job.header.prev_hash
                 });
-                blocked.retain(|job_id| jobs.contains_key(job_id));
+                blocked.retain(|job_id, _| jobs.contains_key(job_id));
             }
             jobs.insert(job.job_id, job.clone());
             if jobs.len() > 16 {
@@ -137,20 +146,30 @@ impl JobManager {
         self.current_job.read().clone()
     }
 
+    /// Claim the right to submit a block for this job.
+    ///
+    /// Only one candidate per job may be in flight, otherwise two miners race
+    /// the node with the same height. The claim expires: every caller must
+    /// release it, and a process that dies or stalls mid-submit must not wedge
+    /// the pool, because a wedged job cannot produce a block and no new template
+    /// arrives while the chain is stuck.
     pub fn try_begin_block_submission(&self, job_id: [u8; 32]) -> bool {
+        let now = Instant::now();
         let mut blocked = self.blocked_jobs.write();
-        blocked.insert(job_id)
+        blocked.retain(|_, claimed_at| now.duration_since(*claimed_at) < BLOCK_SUBMISSION_LEASE);
+        blocked.insert(job_id, now).is_none()
     }
 
-    pub fn finish_block_submission(&self, job_id: [u8; 32], keep_blocked: bool) {
-        if keep_blocked {
-            return;
-        }
+    pub fn finish_block_submission(&self, job_id: [u8; 32]) {
         self.blocked_jobs.write().remove(&job_id);
     }
 
     pub fn is_blocked(&self, job_id: &[u8; 32]) -> bool {
-        self.blocked_jobs.read().contains(job_id)
+        let now = Instant::now();
+        self.blocked_jobs
+            .read()
+            .get(job_id)
+            .is_some_and(|claimed_at| now.duration_since(*claimed_at) < BLOCK_SUBMISSION_LEASE)
     }
 
     pub fn share_difficulty(&self) -> u64 {
@@ -159,5 +178,57 @@ impl JobManager {
 
     pub fn set_share_difficulty(&mut self, d: u64) {
         self.share_difficulty = d;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn job_id(seed: u8) -> [u8; 32] {
+        [seed; 32]
+    }
+
+    #[test]
+    fn only_one_candidate_may_submit_a_block_for_a_job() {
+        let manager = JobManager::new(10);
+        assert!(manager.try_begin_block_submission(job_id(1)));
+        assert!(
+            !manager.try_begin_block_submission(job_id(1)),
+            "a second miner must not race the node with the same height"
+        );
+        assert!(manager.is_blocked(&job_id(1)));
+
+        manager.finish_block_submission(job_id(1));
+        assert!(!manager.is_blocked(&job_id(1)));
+        assert!(
+            manager.try_begin_block_submission(job_id(1)),
+            "the claim must be reusable once released"
+        );
+    }
+
+    #[test]
+    fn a_claim_expires_so_a_stalled_submit_cannot_wedge_the_pool() {
+        let manager = JobManager::new(10);
+        assert!(manager.try_begin_block_submission(job_id(2)));
+
+        // Backdate the claim past its lease, as a stalled or killed submit would
+        // leave it.
+        {
+            let mut blocked = manager.blocked_jobs.write();
+            let stale = Instant::now()
+                .checked_sub(BLOCK_SUBMISSION_LEASE + Duration::from_secs(1))
+                .expect("clock has enough range");
+            blocked.insert(job_id(2), stale);
+        }
+
+        assert!(
+            !manager.is_blocked(&job_id(2)),
+            "an expired claim must not reject work"
+        );
+        assert!(
+            manager.try_begin_block_submission(job_id(2)),
+            "an expired claim must be replaceable"
+        );
     }
 }

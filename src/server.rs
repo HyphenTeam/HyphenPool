@@ -38,6 +38,9 @@ const VARDIFF_MIN_RETARGET_MS: u64 = 20_000;
 /// A change smaller than this keeps the threshold and only consumes the
 /// sample window, so the controller settles instead of dithering.
 const VARDIFF_SIGNIFICANT_CHANGE: f64 = 0.25;
+
+/// Attempts made to fetch the next template after the node accepts a block.
+const REFRESH_ATTEMPTS: u32 = 4;
 /// Initial low difficulty for new miners (ramps up quickly)
 const VARDIFF_INITIAL: u64 = 100;
 
@@ -506,6 +509,38 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                 }
             }
         }
+    }
+
+    /// Fetch the post-block template, retrying a few times.
+    ///
+    /// The node has just accepted a block, so the pool must not sit on the old
+    /// height. A single failed `get_template` used to be terminal: the job stayed
+    /// blocked and no new template arrives while the chain is stuck, so a
+    /// transient node hiccup stopped the pool until an operator intervened.
+    async fn refresh_template_after_block(&self) {
+        let mut delay = std::time::Duration::from_millis(200);
+        for attempt in 1..=REFRESH_ATTEMPTS {
+            match self.tp_client.get_template().await {
+                Ok(tpl) => {
+                    info!(
+                        "Refreshed template after block accept: height={}",
+                        tpl.height
+                    );
+                    self.apply_template(&tpl);
+                    return;
+                }
+                Err(error) => {
+                    warn!(
+                        "Template refresh after block failed (attempt {attempt}/{REFRESH_ATTEMPTS}): {error}"
+                    );
+                    tokio::time::sleep(delay).await;
+                    delay = delay.saturating_mul(2);
+                }
+            }
+        }
+        // The node pushes a template when it produces the next one; the pool is
+        // not wedged because the job claim is already released.
+        warn!("Giving up on post-block template refresh; waiting for the node push");
     }
 
     fn apply_template(&self, tpl: &BlockTemplate) {
@@ -1226,7 +1261,7 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                 let block_data = match crate::wire_config(8 * 1024 * 1024).serialize(&block) {
                     Ok(data) => data,
                     Err(error) => {
-                        self.job_manager.finish_block_submission(job.job_id, false);
+                        self.job_manager.finish_block_submission(job.job_id);
                         return SubmitResult {
                             accepted: false,
                             error: format!("block encoding failed: {error}"),
@@ -1246,6 +1281,12 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                         Ok(result) => {
                             if result.accepted {
                                 info!("Block {} accepted by node", submit_hash);
+                                // The job is finished the moment the node takes
+                                // the block: release the claim before anything
+                                // else, so a slow or failing template refresh
+                                // cannot leave the pool unable to accept the
+                                // next candidate.
+                                self_ref.job_manager.finish_block_submission(job_id);
                                 self_ref.accounting.settle_block(
                                     finder_pubkey,
                                     payout_wallet,
@@ -1255,26 +1296,14 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                                     block_total_fee,
                                     block_difficulty,
                                 );
-                                match tp.get_template().await {
-                                    Ok(tpl) => {
-                                        info!(
-                                            "Refreshed template after block accept: height={}",
-                                            tpl.height
-                                        );
-                                        self_ref.apply_template(&tpl);
-                                    }
-                                    Err(e) => {
-                                        warn!("Failed to refresh template after block: {e}");
-                                        self_ref.job_manager.finish_block_submission(job_id, true);
-                                    }
-                                }
+                                self_ref.refresh_template_after_block().await;
                             } else {
                                 warn!("Block rejected by node: {}", result.error);
-                                self_ref.job_manager.finish_block_submission(job_id, false);
+                                self_ref.job_manager.finish_block_submission(job_id);
                             }
                         }
                         Err(e) => {
-                            self_ref.job_manager.finish_block_submission(job_id, false);
+                            self_ref.job_manager.finish_block_submission(job_id);
                             error!("Failed to submit block to node: {e}");
                         }
                     }
