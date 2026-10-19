@@ -19,6 +19,7 @@ use crate::job::{ActiveJob, JobManager};
 use crate::primitives::{hex_encode, ChainIdentity};
 use crate::protocol::*;
 use crate::share::{verify_share, ClaimedWitnesses, ShareVerdict};
+use crate::telemetry::PoolTelemetry;
 
 /// Target seconds between shares per miner
 const VARDIFF_TARGET_SECS: f64 = 15.0;
@@ -87,6 +88,23 @@ struct VarDiffState {
     /// worth of shares; deciding again on a mixed window is what makes the
     /// controller oscillate.
     last_retarget_ms: u64,
+}
+
+/// Retires a miner session however its connection ends.
+///
+/// The frame loop returns early on every transport error, so teardown written
+/// after the loop only ran when the peer closed politely. An abruptly closed
+/// socket leaked its session, its difficulty history and a wallet the accounting
+/// never saw disconnect.
+struct SessionGuard<'a, T: TemplateProvider + Send + Sync + 'static> {
+    server: &'a PoolServer<T>,
+    miner_pk: [u8; 32],
+}
+
+impl<T: TemplateProvider + Send + Sync + 'static> Drop for SessionGuard<'_, T> {
+    fn drop(&mut self) {
+        self.server.retire_session(&self.miner_pk);
+    }
 }
 
 impl VarDiffState {
@@ -232,6 +250,8 @@ pub struct PoolServer<T: TemplateProvider + Send + Sync + 'static> {
     claimed_witnesses: Arc<RwLock<ClaimedWitnesses>>,
     /// GTM: per-IP connection counts for rate limiting
     ip_connections: Arc<RwLock<HashMap<std::net::IpAddr, usize>>>,
+    /// Live loop state for `/api/pool/status`.
+    telemetry: Arc<PoolTelemetry>,
 }
 
 impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
@@ -281,7 +301,30 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
             miners: Arc::new(RwLock::new(HashMap::new())),
             claimed_witnesses: Arc::new(RwLock::new(ClaimedWitnesses::default())),
             ip_connections: Arc::new(RwLock::new(HashMap::new())),
+            telemetry: Arc::new(PoolTelemetry::new()),
         }
+    }
+
+    /// Handle on the live mining state, for the status endpoint.
+    pub fn telemetry(&self) -> Arc<PoolTelemetry> {
+        Arc::clone(&self.telemetry)
+    }
+
+    /// Retires a session once, on any exit path, and keeps the attached-miner
+    /// count equal to the session map.
+    fn retire_session(&self, miner_pk: &[u8; 32]) {
+        let mut miners = self.miners.write();
+        if let Some(session) = miners.remove(miner_pk) {
+            self.accounting.note_disconnect(*miner_pk);
+            info!(
+                "Miner disconnected: pk={}, wallet={}, shares={}, invalid={}",
+                hex_encode(miner_pk),
+                hex_encode(session.wallet_address),
+                session.shares,
+                session.invalid_shares
+            );
+        }
+        self.telemetry.set_connected_miners(miners.len());
     }
 
     fn session_wallet(&self, miner_pk: &[u8; 32]) -> [u8; 32] {
@@ -530,6 +573,7 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                     return;
                 }
                 Err(error) => {
+                    self.telemetry.record_template_refresh_failure();
                     warn!(
                         "Template refresh after block failed (attempt {attempt}/{REFRESH_ATTEMPTS}): {error}"
                     );
@@ -586,7 +630,8 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
             return;
         }
         match self.job_manager.ingest_template(tpl) {
-            Ok(_job) => {
+            Ok(job) => {
+                self.telemetry.record_job(&job);
                 let _ = self.job_tx.send(PoolBroadcast::NewTemplate);
             }
             Err(e) => warn!("Failed to ingest template: {e}"),
@@ -698,7 +743,14 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                     seen_submission_nonces: VecDeque::with_capacity(256),
                 },
             );
+            self.telemetry.set_connected_miners(miners.len());
         }
+        // Armed only once the session exists: every exit from here on, including
+        // the `?` early returns inside the frame loop, has to retire it.
+        let _session_guard = SessionGuard {
+            server: self.as_ref(),
+            miner_pk,
+        };
         self.accounting.register_view_key(wallet_addr, view_public);
         self.accounting.register_miner(miner_pk, wallet_addr);
 
@@ -760,6 +812,14 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                                 ));
                             }
                             let reply = self.handle_share(&env, &miner_pk).await;
+                            if reply.accepted {
+                                self.telemetry.record_share_accepted();
+                            } else {
+                                self.telemetry.record_share_rejected(&reply.error);
+                            }
+                            if reply.block_found {
+                                self.telemetry.record_block_submitted();
+                            }
                             let reply_payload = reply.encode_to_vec();
                             let (sequence, previous, receipt) = if reply.accepted {
                                 self.next_share_receipt(
@@ -986,22 +1046,8 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
             }
         }
 
-        {
-            let mut miners = self.miners.write();
-            if let Some(session) = miners.remove(&miner_pk) {
-                self.accounting.note_disconnect(miner_pk);
-                info!(
-                    "Miner disconnected: pk={}, wallet={}, shares={}, invalid={}",
-                    hex_encode(miner_pk),
-                    hex_encode(session.wallet_address),
-                    session.shares,
-                    session.invalid_shares
-                );
-            }
-        }
         Ok(())
     }
-
     async fn handle_share(
         self: &Arc<Self>,
         env: &PoolEnvelope,
@@ -1209,9 +1255,9 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                     };
                 }
                 if !neural {
-                    self.claimed_witnesses
-                        .write()
-                        .claim(miner_pk, &submission.witnesses);
+                    let mut claimed = self.claimed_witnesses.write();
+                    claimed.claim(miner_pk, &submission.witnesses);
+                    self.telemetry.set_claimed_witnesses(claimed.len());
                 }
 
                 let wallet_hex = {
@@ -1281,6 +1327,12 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                         Ok(result) => {
                             if result.accepted {
                                 info!("Block {} accepted by node", submit_hash);
+                                self_ref.telemetry.record_block_settled(
+                                    block_height,
+                                    submit_hash.to_string(),
+                                    true,
+                                    "",
+                                );
                                 // The job is finished the moment the node takes
                                 // the block: release the claim before anything
                                 // else, so a slow or failing template refresh
@@ -1299,10 +1351,22 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                                 self_ref.refresh_template_after_block().await;
                             } else {
                                 warn!("Block rejected by node: {}", result.error);
+                                self_ref.telemetry.record_block_settled(
+                                    block_height,
+                                    submit_hash.to_string(),
+                                    false,
+                                    &result.error,
+                                );
                                 self_ref.job_manager.finish_block_submission(job_id);
                             }
                         }
                         Err(e) => {
+                            self_ref.telemetry.record_block_settled(
+                                block_height,
+                                submit_hash.to_string(),
+                                false,
+                                &e.to_string(),
+                            );
                             self_ref.job_manager.finish_block_submission(job_id);
                             error!("Failed to submit block to node: {e}");
                         }
@@ -1348,10 +1412,12 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                         block_hash: Vec::new(),
                     };
                 }
-                let credited = self
-                    .claimed_witnesses
-                    .write()
-                    .claim(miner_pk, &submission.witnesses);
+                let (credited, claimed_total) = {
+                    let mut claimed = self.claimed_witnesses.write();
+                    let credited = claimed.claim(miner_pk, &submission.witnesses);
+                    (credited, claimed.len())
+                };
+                self.telemetry.set_claimed_witnesses(claimed_total);
                 if credited == 0 {
                     return SubmitResult {
                         accepted: false,

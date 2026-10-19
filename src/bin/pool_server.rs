@@ -375,7 +375,12 @@ async fn start_pool<T: TemplateProvider + Send + Sync + 'static>(
         // certificate that does not load, fails the process at startup instead
         // of after miners have committed to this pool.
         let tls = load_tls_identity(tls_arg(&cli.api_tls_cert), tls_arg(&cli.api_tls_key))?;
-        Some(start_pool_api(api_addr, Arc::clone(&accounting), tls)?)
+        Some(start_pool_api(
+            api_addr,
+            Arc::clone(&accounting),
+            pool.telemetry(),
+            tls,
+        )?)
     };
 
     pool_handle.await??;

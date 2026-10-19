@@ -21,6 +21,7 @@ pub mod primitives;
 pub mod protocol;
 pub mod server;
 pub mod share;
+pub mod telemetry;
 pub mod template;
 pub mod tp;
 
@@ -34,5 +35,6 @@ pub use payout::{PayoutAgentClient, PayoutWorker, PayoutWorkerConfig};
 pub use primitives::wire_config;
 pub use protocol::{PoolCodec, PoolMessage};
 pub use server::PoolServer;
+pub use telemetry::PoolTelemetry;
 pub use template::TemplateProviderClient;
 pub use tp::{BlockTemplate, TPError, TemplateProvider};

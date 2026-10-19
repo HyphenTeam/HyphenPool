@@ -7,6 +7,7 @@
 //! ```text
 //! GET /healthz                                    liveness for supervisors
 //! GET /api/pool/info                              mode, fee, pool wallet
+//! GET /api/pool/status                            live mining telemetry
 //! GET /api/pool/wallet/{wallet}/balance?limit=16  one wallet's ledger
 //! ```
 //!
@@ -36,6 +37,7 @@ use crate::accounting::{
     WalletLedgerSummary, WalletRewardEvent,
 };
 use crate::primitives::hex_encode;
+use crate::telemetry::PoolTelemetry;
 
 const ATOMIC_UNITS: u128 = 1_000_000_000_000;
 
@@ -171,6 +173,7 @@ impl ApiRejection {
 enum Endpoint {
     Health,
     PoolInfo,
+    Status,
     WalletBalance {
         wallet: String,
         limit: Option<usize>,
@@ -187,6 +190,7 @@ impl Endpoint {
         let endpoint = match path {
             "/healthz" => Endpoint::Health,
             "/api/pool/info" => Endpoint::PoolInfo,
+            "/api/pool/status" => Endpoint::Status,
             _ => match wallet_segment(path) {
                 None => return Ok(None),
                 Some(segment) => Endpoint::WalletBalance {
@@ -268,6 +272,7 @@ fn percent_decode(input: &str) -> Result<String, ApiRejection> {
 /// Answers one request; the whole API surface lives here.
 struct PoolApiRouter {
     accounting: Arc<PoolAccounting>,
+    telemetry: Arc<PoolTelemetry>,
 }
 
 impl PoolApiRouter {
@@ -299,6 +304,7 @@ impl PoolApiRouter {
         match endpoint {
             Endpoint::Health => json_response(StatusCode::OK, &HealthResponse { status: "ok" }),
             Endpoint::PoolInfo => self.pool_info(),
+            Endpoint::Status => json_response(StatusCode::OK, &self.telemetry.report()),
             Endpoint::WalletBalance { wallet, limit } => self.wallet_balance(&wallet, limit),
         }
     }
@@ -580,6 +586,7 @@ pub fn load_tls_identity(
 pub fn start_pool_api(
     bind_addr: SocketAddr,
     accounting: Arc<PoolAccounting>,
+    telemetry: Arc<PoolTelemetry>,
     tls: Option<TlsSettings>,
 ) -> Result<PoolApi, PoolApiError> {
     let secure = tls.is_some();
@@ -607,7 +614,10 @@ pub fn start_pool_api(
         source,
     })?;
 
-    let router = Arc::new(PoolApiRouter { accounting });
+    let router = Arc::new(PoolApiRouter {
+        accounting,
+        telemetry,
+    });
     let handle = server
         .serve_background(move |request: Request<Body>| router.respond(&request))
         .map_err(|source| PoolApiError::Listen {
@@ -663,9 +673,14 @@ mod tests {
     }
 
     fn api() -> PoolApi {
+        api_with(Arc::new(PoolTelemetry::new()))
+    }
+
+    fn api_with(telemetry: Arc<PoolTelemetry>) -> PoolApi {
         start_pool_api(
             "127.0.0.1:0".parse().expect("loopback address"),
             accounting(),
+            telemetry,
             None,
         )
         .expect("the accounting API binds")
@@ -702,6 +717,48 @@ mod tests {
     }
 
     #[test]
+    fn status_reports_what_the_mining_loop_is_doing() {
+        let telemetry = Arc::new(PoolTelemetry::new());
+        let api = api_with(Arc::clone(&telemetry));
+
+        // Before any node template arrives there is no job to report, which is
+        // exactly the state an operator must be able to tell apart from
+        // "miners are submitting and being refused".
+        let empty = body_json(
+            client()
+                .get(&format!("{}/api/pool/status", api.base_url()))
+                .expect("status answers"),
+        );
+        assert_eq!(empty["status"], "ok");
+        assert_eq!(empty["job"], Value::Null);
+        assert_eq!(empty["shares"]["accepted"], 0);
+        assert_eq!(empty["shares"]["last_rejection"], Value::Null);
+
+        telemetry.set_connected_miners(2);
+        telemetry.record_share_accepted();
+        telemetry.record_share_rejected("stale job");
+        telemetry.record_block_submitted();
+        telemetry.record_block_settled(11, "cd".repeat(32), true, "");
+        telemetry.set_claimed_witnesses(4_096);
+
+        let status = body_json(
+            client()
+                .get(&format!("{}/api/pool/status", api.base_url()))
+                .expect("status answers"),
+        );
+        assert_eq!(status["connected_miners"], 2);
+        assert_eq!(status["claimed_witnesses"], 4_096);
+        assert_eq!(status["shares"]["accepted"], 1);
+        assert_eq!(status["shares"]["rejected"], 1);
+        assert_eq!(status["shares"]["last_rejection"], "stale job");
+        assert_eq!(status["blocks"]["submitted"], 1);
+        assert_eq!(status["blocks"]["accepted"], 1);
+        assert_eq!(status["blocks"]["rejected"], 0);
+        assert_eq!(status["last_block"]["height"], 11);
+        assert_eq!(status["last_block"]["accepted"], true);
+    }
+
+    #[test]
     fn wallet_balance_reports_the_ledger_of_a_registered_miner() {
         let accounting = accounting();
         let wallet = [7u8; 32];
@@ -711,6 +768,7 @@ mod tests {
         let api = start_pool_api(
             "127.0.0.1:0".parse().expect("loopback address"),
             Arc::clone(&accounting),
+            Arc::new(PoolTelemetry::new()),
             None,
         )
         .expect("the accounting API binds");
@@ -765,6 +823,7 @@ mod tests {
         let api = start_pool_api(
             "127.0.0.1:0".parse().expect("loopback address"),
             accounting,
+            Arc::new(PoolTelemetry::new()),
             None,
         )
         .expect("the accounting API binds");
