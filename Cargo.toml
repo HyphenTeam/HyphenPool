@@ -27,6 +27,7 @@ parking_lot = "0.13.0"
 prost = "0.14.6"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+tempfile = "3.27.0"
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["full"] }
 tracing = "0.1.44"

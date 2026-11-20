@@ -1801,7 +1801,7 @@ fn encode_wallet_address(
 fn address_version(network: &[u8; 4]) -> Option<u8> {
     match network {
         b"HYPN" => Some(1),
-        b"HYTS" | b"HYDV" | b"HYNN" | b"HYCD" => Some(2),
+        b"HYTS" | b"HYDV" | b"HYNN" | b"HYCD" | b"HYAC" | b"HYOF" => Some(2),
         _ => None,
     }
 }

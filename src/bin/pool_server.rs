@@ -38,10 +38,10 @@ struct Cli {
     #[arg(long, default_value = "100")]
     share_difficulty: u64,
 
-    /// Network selection (mainnet | testnet | devnet | neural-devnet)
+    /// Consensus network used by the template provider and miners.
     #[arg(
         long,
-        value_parser = ["mainnet", "testnet", "devnet", "neural-devnet", "contract-devnet"],
+        value_parser = ["mainnet", "testnet", "devnet", "neural-devnet", "contract-devnet", "compute-devnet", "offline-devnet"],
         default_value = "devnet"
     )]
     network: String,
@@ -187,6 +187,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "testnet" => ChainConfig::testnet(),
         "devnet" => ChainConfig::devnet(),
         "neural-devnet" => ChainConfig::neural_devnet(),
+        "compute-devnet" => ChainConfig {
+            network_name: "hyphen-compute-devnet-v1".into(),
+            network_magic: *b"HYAC",
+            consensus_features: hyphen_core::FEATURE_USEFUL_WORK
+                | hyphen_pool::primitives::FEATURE_ASSET_RULES_V1
+                | (1 << 10),
+            ..ChainConfig::devnet()
+        },
+        "offline-devnet" => ChainConfig {
+            network_name: "hyphen-offline-devnet-v1".into(),
+            network_magic: *b"HYOF",
+            consensus_features: hyphen_pool::primitives::FEATURE_ASSET_RULES_V1 | (1 << 11),
+            ..ChainConfig::devnet()
+        },
         "contract-devnet" => ChainConfig {
             network_name: "hyphen-contract-devnet-v1".into(),
             network_magic: *b"HYCD",
@@ -451,38 +465,37 @@ fn write_secret_key(
     secret: &[u8; 32],
     overwrite: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true);
-    if overwrite {
-        options.create(true).truncate(true);
-    } else {
-        options.create_new(true);
-    }
+    use std::io::Write;
+
+    let parent = path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."));
+    let mut staged = tempfile::NamedTempFile::new_in(parent)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        use std::os::unix::fs::PermissionsExt;
+        staged
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
-    let mut file = options.open(path).map_err(|error| {
-        let hint = if error.kind() == std::io::ErrorKind::AlreadyExists {
+    staged.write_all(secret)?;
+    staged.as_file().sync_all()?;
+    let installed = if overwrite {
+        staged.persist(path)
+    } else {
+        staged.persist_noclobber(path)
+    };
+    installed.map_err(|error| {
+        let hint = if error.error.kind() == std::io::ErrorKind::AlreadyExists {
             "; refusing to replace an existing pool key (pass --force only when rotating it)"
         } else {
             ""
         };
         format!("cannot create key file '{}': {error}{hint}", path.display())
     })?;
-    use std::io::Write;
-    let written = file.write_all(secret).and_then(|()| file.sync_all());
-    drop(file);
-    if let Err(error) = written {
-        let _ = std::fs::remove_file(path);
-        return Err(format!("cannot write key file '{}': {error}", path.display()).into());
-    }
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
+    std::fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
 
@@ -490,15 +503,42 @@ fn warn_if_key_file_is_shared(path: &str) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Ok(metadata) = std::fs::metadata(path) {
-            if metadata.permissions().mode() & 0o077 != 0 {
-                tracing::warn!(
-                    "pool key file '{}' is accessible by group or other; run chmod 600 on it",
-                    path
-                );
-            }
+        if let Ok(metadata) = std::fs::metadata(path)
+            && metadata.permissions().mode() & 0o077 != 0
+        {
+            tracing::warn!(
+                "pool key file '{}' is accessible by group or other; run chmod 600 on it",
+                path
+            );
         }
     }
     #[cfg(not(unix))]
     let _ = path;
+}
+
+#[cfg(test)]
+mod keygen_tests {
+    use super::write_secret_key;
+
+    #[test]
+    fn rotation_replaces_the_key_without_modifying_the_old_inode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pool.key");
+        let old = dir.path().join("old.key");
+        write_secret_key(&path, &[1; 32], false).unwrap();
+        std::fs::hard_link(&path, &old).unwrap();
+        assert!(write_secret_key(&path, &[2; 32], false).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), [1; 32]);
+        write_secret_key(&path, &[2; 32], true).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), [2; 32]);
+        assert_eq!(std::fs::read(old).unwrap(), [1; 32]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
 }
