@@ -259,23 +259,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         sk
     } else {
         warn_if_key_file_is_shared(&cli.key_file);
-        let data = std::fs::read(&cli.key_file).map_err(|error| {
+        use std::io::Read;
+        let mut file = std::fs::File::open(&cli.key_file).map_err(|error| {
             format!(
                 "cannot read --key-file '{}': {error}; create it with `hyphen-pool-server keygen --output {}`",
                 cli.key_file, cli.key_file
             )
         })?;
-        if data.len() != 32 {
+        let mut key = SecretKey([0; 32]);
+        file.read_exact(&mut key.0)?;
+        if file.read(&mut [0])? != 0 {
             return Err(format!(
-                "--key-file '{}' must contain exactly 32 bytes, found {}",
-                cli.key_file,
-                data.len()
+                "--key-file '{}' must contain exactly 32 bytes",
+                cli.key_file
             )
             .into());
         }
-        let mut bytes = [0u8; 32];
-        bytes.copy_from_slice(&data);
-        SecretKey(bytes)
+        key
     };
 
     info!("Pool public key: {}", sk.public_key());

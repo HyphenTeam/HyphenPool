@@ -51,6 +51,7 @@ const VARDIFF_INITIAL: u64 = 100;
 const GTM_WARMUP_SHARES: u64 = 100;
 /// Maximum connections from a single IP address
 const GTM_MAX_CONNECTIONS_PER_IP: usize = 32;
+const MAX_MINER_CONNECTIONS: usize = 256;
 
 /// Grace window duration for VarDiff transitions. Shares mined at any
 /// difficulty that was active within this window will be accepted.
@@ -239,14 +240,13 @@ pub struct PoolServer<T: TemplateProvider + Send + Sync + 'static> {
     tp_client: Arc<T>,
     accounting: Arc<PoolAccounting>,
     candidate_submission: tokio::sync::Mutex<()>,
+    block_refresh: tokio::sync::Notify,
     pool_key: SecretKey,
     pool_id: String,
     cfg: ChainConfig,
     bind_addr: SocketAddr,
     job_tx: broadcast::Sender<PoolBroadcast>,
     miners: Arc<RwLock<HashMap<[u8; 32], MinerSession>>>,
-    /// GTM: per-IP connection counts for rate limiting
-    ip_connections: Arc<RwLock<HashMap<std::net::IpAddr, usize>>>,
     /// Live loop state for `/api/pool/status`.
     telemetry: Arc<PoolTelemetry>,
 }
@@ -291,13 +291,13 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
             tp_client,
             accounting,
             candidate_submission: tokio::sync::Mutex::new(()),
+            block_refresh: tokio::sync::Notify::new(),
             pool_key,
             pool_id,
             cfg,
             bind_addr,
             job_tx,
             miners: Arc::new(RwLock::new(HashMap::new())),
-            ip_connections: Arc::new(RwLock::new(HashMap::new())),
             telemetry: Arc::new(PoolTelemetry::new()),
         }
     }
@@ -458,33 +458,40 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
         let listener = TcpListener::bind(self.bind_addr).await?;
         info!("Pool server listening on {}", self.bind_addr);
 
-        let server = Arc::clone(&self);
-        tokio::spawn(async move {
-            server.template_refresh_loop().await;
+        let mut refresh = std::pin::pin!(self.template_refresh_loop());
+        let mut accepted_blocks = std::pin::pin!(async {
+            loop {
+                self.block_refresh.notified().await;
+                self.refresh_template_after_block().await;
+            }
         });
+        let mut sessions = tokio::task::JoinSet::new();
+        let mut ip_counts = HashMap::<std::net::IpAddr, usize>::new();
+        let mut peers = HashMap::new();
 
         loop {
-            let (stream, addr) = listener.accept().await?;
-
-            {
-                let mut ip_map = self.ip_connections.write();
-                let count = ip_map.entry(addr.ip()).or_insert(0);
-                if *count >= GTM_MAX_CONNECTIONS_PER_IP {
-                    warn!(
-                        "GTM: rejecting connection from {addr}: {} connections already active from this IP",
-                        *count
-                    );
-                    drop(stream);
+            let (stream, addr) = tokio::select! {
+                () = &mut refresh => return Err(PoolError::Internal("template refresh stopped".into())),
+                () = &mut accepted_blocks => return Err(PoolError::Internal("block refresh stopped".into())),
+                Some(done) = sessions.join_next_with_id(), if !sessions.is_empty() => {
+                    let id = match done { Ok((id, ())) => id, Err(error) => { warn!("miner session stopped: {error}"); error.id() } };
+                    if let Some(ip) = peers.remove(&id) && let Some(count) = ip_counts.get_mut(&ip) {
+                        *count -= 1;
+                        if *count == 0 { ip_counts.remove(&ip); }
+                    }
                     continue;
                 }
-                *count += 1;
+                incoming = listener.accept(), if sessions.len() < MAX_MINER_CONNECTIONS => incoming?,
+            };
+            let count = ip_counts.entry(addr.ip()).or_default();
+            if *count >= GTM_MAX_CONNECTIONS_PER_IP {
+                continue;
             }
+            *count += 1;
 
             info!("Miner connected from {addr}");
             let server = Arc::clone(&self);
-            let ip_connections = Arc::clone(&self.ip_connections);
-            let peer_ip = addr.ip();
-            tokio::spawn(async move {
+            let task = sessions.spawn(async move {
                 if let Err(e) = server.handle_connection(stream, addr).await {
                     match e {
                         PoolError::FrameTooLarge(len) => {
@@ -498,17 +505,8 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                         other => warn!("Miner {addr} disconnected: {other}"),
                     }
                 }
-                // GTM: decrement IP connection count on disconnect
-                {
-                    let mut ip_map = ip_connections.write();
-                    if let Some(count) = ip_map.get_mut(&peer_ip) {
-                        *count = count.saturating_sub(1);
-                        if *count == 0 {
-                            ip_map.remove(&peer_ip);
-                        }
-                    }
-                }
             });
+            peers.insert(task.id(), addr.ip());
         }
     }
 
@@ -1346,8 +1344,7 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                         ..Default::default()
                     };
                 }
-                let server = Arc::clone(self);
-                tokio::spawn(async move { server.refresh_template_after_block().await });
+                self.block_refresh.notify_one();
 
                 {
                     let mut miners = self.miners.write();
