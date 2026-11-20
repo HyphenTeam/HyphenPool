@@ -90,6 +90,7 @@ struct WalletBalanceResponse {
     accumulated_share_difficulty: String,
     pending_payout: String,
     pending_payout_atomic: String,
+    reward_deficit_atomic: String,
     reserved_payout: String,
     reserved_payout_atomic: String,
     direct_reward: String,
@@ -402,7 +403,8 @@ fn map_summary(summary: WalletLedgerSummary) -> WalletBalanceResponse {
         .pending_payout_atomic
         .saturating_add(summary.reserved_payout_atomic)
         .saturating_add(summary.direct_reward_atomic)
-        .saturating_add(summary.total_paid_atomic);
+        .saturating_add(summary.total_paid_atomic)
+        .saturating_sub(summary.reward_deficit_atomic);
 
     WalletBalanceResponse {
         wallet_address: hex_encode(summary.wallet_address),
@@ -417,6 +419,7 @@ fn map_summary(summary: WalletLedgerSummary) -> WalletBalanceResponse {
         accumulated_share_difficulty: summary.accumulated_share_difficulty.to_string(),
         pending_payout: format_hpn_128(summary.pending_payout_atomic),
         pending_payout_atomic: summary.pending_payout_atomic.to_string(),
+        reward_deficit_atomic: summary.reward_deficit_atomic.to_string(),
         reserved_payout: format_hpn_128(summary.reserved_payout_atomic),
         reserved_payout_atomic: summary.reserved_payout_atomic.to_string(),
         direct_reward: format_hpn_128(summary.direct_reward_atomic),
@@ -566,7 +569,7 @@ pub fn load_tls_identity(
                 cert: cert.unwrap_or("<unset>").to_string(),
                 key: key.unwrap_or("<unset>").to_string(),
                 reason: "a certificate and a key must be given together".to_string(),
-            })
+            });
         }
     };
 
@@ -808,10 +811,12 @@ mod tests {
             ))
             .expect("the balance endpoint answers");
         assert_eq!(response.status.as_u16(), 400);
-        assert!(body_json(response)["error"]
-            .as_str()
-            .expect("an error message")
-            .contains("network"));
+        assert!(
+            body_json(response)["error"]
+                .as_str()
+                .expect("an error message")
+                .contains("network")
+        );
     }
 
     #[test]
@@ -908,10 +913,12 @@ mod tests {
                 .map(|value| value.as_bytes()),
             Some(&b"*"[..])
         );
-        assert!(preflight
-            .headers
-            .get("access-control-allow-methods")
-            .is_some());
+        assert!(
+            preflight
+                .headers
+                .get("access-control-allow-methods")
+                .is_some()
+        );
     }
 
     #[test]
@@ -934,9 +941,11 @@ mod tests {
 
     #[test]
     fn a_tls_pair_must_be_complete_and_valid() {
-        assert!(load_tls_identity(None, None)
-            .expect("no certificate is not an error")
-            .is_none());
+        assert!(
+            load_tls_identity(None, None)
+                .expect("no certificate is not an error")
+                .is_none()
+        );
 
         let incomplete =
             load_tls_identity(Some("cert.pem"), None).expect_err("half a pair must be refused");

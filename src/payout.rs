@@ -25,6 +25,7 @@ const AGENT_READ_TIMEOUT: Duration = Duration::from_secs(90);
 
 const HEALTH_PATH: &str = "/v1/health";
 const SUBMIT_PATH: &str = "/v1/submit";
+const STATUS_PATH: &str = "/v1/status";
 
 #[derive(Clone, Debug)]
 pub struct PayoutWorkerConfig {
@@ -231,6 +232,8 @@ pub struct PayoutWorker {
     accounting: Arc<PoolAccounting>,
     client: Arc<PayoutAgentClient>,
     config: PayoutWorkerConfig,
+    reconciliation_cursor: tokio::sync::Mutex<String>,
+    reward_source: Option<Arc<crate::TemplateProviderClient>>,
 }
 
 impl PayoutWorker {
@@ -252,6 +255,8 @@ impl PayoutWorker {
             accounting,
             client: Arc::new(client),
             config,
+            reconciliation_cursor: tokio::sync::Mutex::new(String::new()),
+            reward_source: None,
         })
     }
 
@@ -259,6 +264,11 @@ impl PayoutWorker {
         let fee = self.call_agent(|client| client.health()).await?;
         info!("Automatic payout agent verified; transaction fee={fee}");
         Ok(())
+    }
+
+    pub fn with_reward_source(mut self, source: Arc<crate::TemplateProviderClient>) -> Self {
+        self.reward_source = Some(source);
+        self
     }
 
     /// Runs one client call on the blocking pool.
@@ -288,11 +298,62 @@ impl PayoutWorker {
     }
 
     pub async fn process_once(&self) -> Result<(), PayoutError> {
+        let mut cursor = self.reconciliation_cursor.lock().await;
+        let rewards_verified = match &self.reward_source {
+            Some(source) => match source.reconcile_rewards(&self.accounting).await {
+                Ok(()) => true,
+                Err(error) => {
+                    warn!(%error, "Pool reward reconciliation deferred new reservations");
+                    false
+                }
+            },
+            None => true,
+        };
+        if let Some(confirmed) = self.accounting.next_confirmed_payout(&cursor)? {
+            *cursor = confirmed.intent_id.clone();
+            let intent = confirmed.intent_id.clone();
+            let response = self
+                .call_agent(move |client| {
+                    client.call(
+                        STATUS_PATH,
+                        &serde_json::json!({"version": PROTOCOL_VERSION, "intent_id": intent}),
+                    )
+                })
+                .await?;
+            let PayoutStatus::Confirmed { tx_hash, .. } = confirmed.status else {
+                return Err(PayoutError::Protocol("expected a confirmed payout".into()));
+            };
+            if response.intent_id != confirmed.intent_id || response.tx_hash != tx_hash {
+                return Err(PayoutError::Protocol(
+                    "agent returned a different payout identity".into(),
+                ));
+            }
+            let inclusion = match response
+                .status
+                .ok_or_else(|| PayoutError::Protocol("agent omitted transaction status".into()))?
+            {
+                AgentTransactionStatus::Confirmed {
+                    block_height,
+                    confirmations,
+                    ..
+                } if confirmations >= self.config.required_confirmations => {
+                    Some((block_height, confirmations))
+                }
+                _ => None,
+            };
+            self.accounting.reconcile_confirmed_payout(
+                &confirmed.intent_id,
+                &tx_hash,
+                inclusion,
+            )?;
+        }
         let payout = match self.accounting.active_payout() {
             Some(payout) => payout,
-            None => match self.accounting.reserve_next_payout(
+            None if !rewards_verified => return Ok(()),
+            None => match self.accounting.reserve_payout(
                 self.config.minimum_payout_atomic,
                 self.config.maximum_payout_atomic,
+                self.reward_source.is_some(),
             )? {
                 Some(payout) => payout,
                 None => return Ok(()),
@@ -306,12 +367,11 @@ impl PayoutWorker {
 
         if let PayoutStatus::Submitted { tx_hash, .. } | PayoutStatus::Confirmed { tx_hash, .. } =
             &payout.status
+            && tx_hash != &response.tx_hash
         {
-            if tx_hash != &response.tx_hash {
-                return Err(PayoutError::Protocol(
-                    "agent changed the transaction bound to an existing payout".into(),
-                ));
-            }
+            return Err(PayoutError::Protocol(
+                "agent changed the transaction bound to an existing payout".into(),
+            ));
         }
         self.accounting
             .mark_payout_submitted(&payout.intent_id, &response.tx_hash)?;
@@ -324,19 +384,18 @@ impl PayoutWorker {
             confirmations,
             ..
         } = status
+            && confirmations >= self.config.required_confirmations
         {
-            if confirmations >= self.config.required_confirmations {
-                self.accounting.mark_payout_confirmed(
-                    &payout.intent_id,
-                    &response.tx_hash,
-                    block_height,
-                    confirmations,
-                )?;
-                info!(
-                    "Automatic payout {} confirmed in transaction {} with {} confirmations",
-                    payout.intent_id, response.tx_hash, confirmations
-                );
-            }
+            self.accounting.mark_payout_confirmed(
+                &payout.intent_id,
+                &response.tx_hash,
+                block_height,
+                confirmations,
+            )?;
+            info!(
+                "Automatic payout {} confirmed in transaction {} with {} confirmations",
+                payout.intent_id, response.tx_hash, confirmations
+            );
         }
         Ok(())
     }
@@ -361,9 +420,9 @@ fn is_loopback(ip: IpAddr) -> bool {
 mod tests {
     use super::*;
     use courierust::courierust_body::Body as AgentBody;
+    use courierust::courierust_http::StatusCode;
     use courierust::courierust_http::request::Request as AgentRequestWire;
     use courierust::courierust_http::response::Response as AgentResponseWire;
-    use courierust::courierust_http::StatusCode;
     use courierust::courierust_server::{Server, ServerConfig};
 
     #[test]
@@ -390,17 +449,19 @@ mod tests {
                 state_dir: None,
             },
         ));
-        assert!(PayoutWorker::new(
-            accounting,
-            client,
-            PayoutWorkerConfig {
-                minimum_payout_atomic: 1,
-                maximum_payout_atomic: 1,
-                required_confirmations: 0,
-                interval: Duration::from_secs(1),
-            },
-        )
-        .is_err());
+        assert!(
+            PayoutWorker::new(
+                accounting,
+                client,
+                PayoutWorkerConfig {
+                    minimum_payout_atomic: 1,
+                    maximum_payout_atomic: 1,
+                    required_confirmations: 0,
+                    interval: Duration::from_secs(1),
+                },
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]

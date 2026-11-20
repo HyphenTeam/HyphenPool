@@ -1,7 +1,7 @@
 [package]
 name = "hyphen-pool"
-version = "0.1.1"
-edition = "2021"
+version = "0.1.2"
+edition = "2024"
 authors = ["Hyphen Contributors"]
 license-file = "LICENSE"
 description = "Mining pool server for the Hyphen PO-UW v3 chain"
@@ -13,24 +13,25 @@ name = "hyphen-pool-server"
 path = "src/bin/pool_server.rs"
 
 [dependencies]
-async-trait = "0.1.91"
-clap = { version = "4.6.7", features = ["derive"] }
-courierust = "1.0.9"
-hyphen-core = { git = "https://github.com/HyphenTeam/Hyphen.git", rev = "c57f908464df6634eba829e8267f9c5330b3a4b4" }
-hyphen-crypto = { git = "https://github.com/HyphenTeam/Hyphen.git", rev = "c57f908464df6634eba829e8267f9c5330b3a4b4" }
-hyphen-pow = { git = "https://github.com/HyphenTeam/Hyphen.git", rev = "c57f908464df6634eba829e8267f9c5330b3a4b4" }
-hyphen-neural = { git = "https://github.com/HyphenTeam/Hyphen.git", rev = "c57f908464df6634eba829e8267f9c5330b3a4b4" }
-hyphen-transport = { git = "https://github.com/HyphenTeam/Hyphen.git", rev = "c57f908464df6634eba829e8267f9c5330b3a4b4" }
-rustbinary = { version = "0.1.8", features = ["derive"] }
-parking_lot = "0.12"
-prost = "0.14.4"
+redb = "5.0.0"
+async-trait = "0.1.92"
+clap = { version = "4.6.8", features = ["derive"] }
+courierust = "1.1.3"
+hyphen-core = { git = "https://github.com/HyphenTeam/Hyphen.git", rev = "951ea013f0b61115632f463cea22850cd972df83" }
+hyphen-crypto = { git = "https://github.com/HyphenTeam/Hyphen.git", rev = "951ea013f0b61115632f463cea22850cd972df83" }
+hyphen-pow = { git = "https://github.com/HyphenTeam/Hyphen.git", rev = "951ea013f0b61115632f463cea22850cd972df83" }
+hyphen-neural = { git = "https://github.com/HyphenTeam/Hyphen.git", rev = "951ea013f0b61115632f463cea22850cd972df83" }
+hyphen-transport = { git = "https://github.com/HyphenTeam/Hyphen.git", rev = "951ea013f0b61115632f463cea22850cd972df83" }
+rustbinary = { version = "0.1.10", features = ["derive"] }
+parking_lot = "0.13.0"
+prost = "0.14.6"
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
-thiserror = "2.0.19"
-tokio = { version = "1.53.1", features = ["full"] }
-tracing = "0.1"
-zeroize = { version = "1.9.0", features = ["derive"] }
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["full"] }
+tracing = "0.1.44"
+zeroize = { version = "1.9.2", features = ["derive"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
 blake3 = "1.8.7"

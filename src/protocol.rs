@@ -1,6 +1,6 @@
 use prost::Message;
 
-use crate::primitives::{blake3_hash_many, fill_system_random, PublicKey, SecretKey, Signature};
+use crate::primitives::{PublicKey, SecretKey, Signature, blake3_hash_many, fill_system_random};
 
 const SHARE_RECEIPT_DOMAIN: &[u8] = b"Hyphen/NCAP/share-receipt/v1";
 
@@ -355,28 +355,42 @@ pub enum PoolError {
 pub struct PoolCodec;
 
 impl PoolCodec {
+    const FRAME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
     pub async fn read_envelope(
-        stream: &mut tokio::net::TcpStream,
+        stream: &mut (impl tokio::io::AsyncRead + Unpin),
     ) -> Result<PoolEnvelope, PoolError> {
         use tokio::io::AsyncReadExt;
-        let len = stream.read_u32().await?;
-        if len > 1024 * 1024 {
-            return Err(PoolError::FrameTooLarge(len));
-        }
-        let mut buf = vec![0u8; len as usize];
-        stream.read_exact(&mut buf).await?;
-        let envelope = PoolEnvelope::decode(&buf[..])?;
-        Ok(envelope)
+        tokio::time::timeout(Self::FRAME_TIMEOUT, async {
+            let len = stream.read_u32().await?;
+            if len > 1024 * 1024 {
+                return Err(PoolError::FrameTooLarge(len));
+            }
+            // Allocate for arriving bytes. A length prefix alone should only
+            // hold a small receive buffer until the rest of the frame arrives.
+            let mut buf = Vec::with_capacity((len as usize).min(8192));
+            stream.take(u64::from(len)).read_to_end(&mut buf).await?;
+            if buf.len() != len as usize {
+                return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+            }
+            Ok(PoolEnvelope::decode(&buf[..])?)
+        })
+        .await
+        .map_err(std::io::Error::from)?
     }
 
     pub async fn write_envelope(
-        stream: &mut tokio::net::TcpStream,
+        stream: &mut (impl tokio::io::AsyncWrite + Unpin),
         envelope: &PoolEnvelope,
     ) -> Result<(), PoolError> {
         use tokio::io::AsyncWriteExt;
         let data = envelope.encode_to_vec();
-        stream.write_u32(data.len() as u32).await?;
-        stream.write_all(&data).await?;
+        tokio::time::timeout(Self::FRAME_TIMEOUT, async {
+            stream.write_u32(data.len() as u32).await?;
+            stream.write_all(&data).await
+        })
+        .await
+        .map_err(std::io::Error::from)??;
         Ok(())
     }
 }
@@ -386,6 +400,26 @@ pub type PoolMessage = PoolEnvelope;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn partial_frame_survives_interleaved_broadcasts() {
+        use tokio::io::AsyncWriteExt;
+        let envelope = PoolEnvelope {
+            msg_type: MSG_KEEPALIVE,
+            payload: vec![3; 19],
+            ..Default::default()
+        };
+        let body = envelope.encode_to_vec();
+        let frame = [(body.len() as u32).to_be_bytes().as_slice(), &body].concat();
+        let (mut writer, mut reader) = tokio::io::duplex(128);
+        let mut incoming = std::pin::pin!(PoolCodec::read_envelope(&mut reader));
+        for byte in &frame[..frame.len() - 1] {
+            writer.write_all(&[*byte]).await.unwrap();
+            tokio::select! { biased; _ = &mut incoming => panic!("incomplete frame"), _ = std::future::ready(()) => {} }
+        }
+        writer.write_all(&frame[frame.len() - 1..]).await.unwrap();
+        assert_eq!(incoming.await.unwrap().encode_to_vec(), body);
+    }
 
     #[test]
     fn signed_envelope_rejects_payload_tampering() {

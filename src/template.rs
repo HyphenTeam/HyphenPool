@@ -1,37 +1,48 @@
 use prost::Message;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tracing::warn;
+mod canonical;
 
 use crate::primitives::ChainIdentity;
 use crate::primitives::{ChainConfig, SecretKey};
 use crate::tp::{
-    read_envelope, write_envelope, BlockTemplate, DeclareJobRequest, DeclareJobResult,
-    SignedEnvelope, SubmitBlockRequest, SubmitBlockResult, TPError, TemplateProvider,
-    TemplateRequest, TP_DECLARE_JOB, TP_DECLARE_JOB_RESULT, TP_GET_TEMPLATE, TP_SUBMIT_BLOCK,
-    TP_SUBMIT_RESULT, TP_SUBSCRIBE, TP_TEMPLATE,
+    BlockTemplate, DeclareJobRequest, DeclareJobResult, SignedEnvelope, SubmitBlockRequest,
+    SubmitBlockResult, TP_DECLARE_JOB, TP_DECLARE_JOB_RESULT, TP_GET_TEMPLATE, TP_SUBMIT_BLOCK,
+    TP_SUBMIT_RESULT, TP_SUBSCRIBE, TP_TEMPLATE, TPError, TemplateProvider, TemplateRequest,
+    read_envelope, write_envelope,
 };
 
 pub struct TemplateProviderClient {
     addr: String,
     sk: SecretKey,
-    request_stream: Arc<Mutex<TcpStream>>,
-    template_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<SignedEnvelope>>>>,
+    request_stream: Mutex<Option<TcpStream>>,
+    template_rx: Arc<Mutex<Option<mpsc::Receiver<SignedEnvelope>>>>,
     cfg: ChainConfig,
+    reward_anchor: Mutex<Option<(u64, Vec<u8>)>>,
 }
 
 impl TemplateProviderClient {
     pub async fn connect(addr: &str, sk: &SecretKey, cfg: &ChainConfig) -> Result<Self, TPError> {
-        let request_stream = TcpStream::connect(addr).await?;
+        let request_stream = Self::connect_stream(addr).await?;
 
         Ok(Self {
             addr: addr.to_string(),
             sk: sk.clone(),
-            request_stream: Arc::new(Mutex::new(request_stream)),
+            request_stream: Mutex::new(Some(request_stream)),
             template_rx: Arc::new(Mutex::new(None)),
             cfg: cfg.clone(),
+            reward_anchor: Mutex::new(None),
         })
+    }
+
+    async fn connect_stream(addr: &str) -> Result<TcpStream, TPError> {
+        tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(addr))
+            .await
+            .map_err(|_| TPError::Protocol("template provider connection timed out".into()))?
+            .map_err(TPError::from)
     }
 
     async fn request_response(
@@ -39,15 +50,23 @@ impl TemplateProviderClient {
         request: SignedEnvelope,
         expected_type: u32,
     ) -> Result<SignedEnvelope, TPError> {
-        let mut last_error = None;
-
+        let mut slot = self.request_stream.lock().await;
         for attempt in 0..2 {
-            let mut stream = self.request_stream.lock().await;
-            let response = match write_envelope(&mut *stream, &request).await {
-                Ok(()) => read_envelope(&mut *stream).await,
-                Err(e) => Err(e),
+            // Taking ownership also discards a partially consumed frame on cancellation.
+            let mut stream = match slot.take() {
+                Some(stream) => stream,
+                None => Self::connect_stream(&self.addr).await?,
             };
-
+            let response = tokio::time::timeout(Duration::from_secs(25), async {
+                write_envelope(&mut stream, &request).await?;
+                read_envelope(&mut stream).await
+            })
+            .await
+            .unwrap_or_else(|_| {
+                Err(TPError::Protocol(
+                    "template provider request timed out".into(),
+                ))
+            });
             match response {
                 Ok(response) => {
                     if !response.verify() {
@@ -59,24 +78,22 @@ impl TemplateProviderClient {
                             response.msg_type,
                         )));
                     }
+                    *slot = Some(stream);
                     return Ok(response);
                 }
                 Err(e) => {
-                    last_error = Some(e);
-                    if attempt == 0 {
-                        *stream = TcpStream::connect(&self.addr).await?;
-                        continue;
+                    if attempt == 1 {
+                        return Err(e);
                     }
                 }
             }
         }
 
-        Err(last_error.unwrap_or_else(|| TPError::Protocol("request failed".into())))
+        unreachable!("the second attempt returns its result");
     }
 
-    async fn spawn_subscription_reader(&self) -> Result<(), TPError> {
-        let mut stream = TcpStream::connect(&self.addr).await?;
-        let req = TemplateRequest {
+    fn identity_request(&self) -> TemplateRequest {
+        TemplateRequest {
             requester_pubkey: self.sk.public_key().as_bytes().to_vec(),
             network_magic: self.cfg.network_magic.to_vec(),
             protocol_version: hyphen_transport::POOL_PROTOCOL_VERSION,
@@ -85,11 +102,16 @@ impl TemplateProviderClient {
                 .genesis_hash
                 .as_bytes()
                 .to_vec(),
-        };
+        }
+    }
+
+    async fn spawn_subscription_reader(&self) -> Result<(), TPError> {
+        let mut stream = Self::connect_stream(&self.addr).await?;
+        let req = self.identity_request();
         let env = SignedEnvelope::sign(TP_SUBSCRIBE, req.encode_to_vec(), &self.sk);
         write_envelope(&mut stream, &env).await?;
 
-        let (template_tx, template_rx) = mpsc::unbounded_channel::<SignedEnvelope>();
+        let (template_tx, template_rx) = mpsc::channel::<SignedEnvelope>(1);
 
         {
             let mut rx_slot = self.template_rx.lock().await;
@@ -105,7 +127,7 @@ impl TemplateProviderClient {
                             warn!("Rejected template envelope with an invalid signature");
                             continue;
                         }
-                        if template_tx.send(env).is_err() {
+                        if template_tx.send(env).await.is_err() {
                             break;
                         }
                     }
@@ -130,16 +152,7 @@ impl TemplateProviderClient {
 #[async_trait::async_trait]
 impl TemplateProvider for TemplateProviderClient {
     async fn get_template(&self) -> Result<BlockTemplate, TPError> {
-        let req = TemplateRequest {
-            requester_pubkey: self.sk.public_key().as_bytes().to_vec(),
-            network_magic: self.cfg.network_magic.to_vec(),
-            protocol_version: hyphen_transport::POOL_PROTOCOL_VERSION,
-            consensus_params_hash: self.cfg.consensus_params_hash().to_vec(),
-            genesis_hash: ChainIdentity::of(&self.cfg)
-                .genesis_hash
-                .as_bytes()
-                .to_vec(),
-        };
+        let req = self.identity_request();
         let env = SignedEnvelope::sign(TP_GET_TEMPLATE, req.encode_to_vec(), &self.sk);
         let resp = self.request_response(env, TP_TEMPLATE).await?;
         BlockTemplate::decode(&resp.payload[..]).map_err(TPError::from)

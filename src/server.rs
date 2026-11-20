@@ -9,16 +9,16 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
-use crate::accounting::PoolAccounting;
+use crate::accounting::{PendingBlock, PoolAccounting};
 use crate::primitives::{
-    blake3_hash, Block, BlockAuthorization, ChainConfig, SecretKey, FROZEN_BLOCK_VERSION,
+    Block, BlockAuthorization, ChainConfig, FROZEN_BLOCK_VERSION, SecretKey, blake3_hash,
 };
-use crate::tp::{BlockTemplate, TemplateProvider, TP_TEMPLATE};
+use crate::tp::{BlockTemplate, TP_TEMPLATE, TemplateProvider};
 
 use crate::job::{ActiveJob, JobManager};
-use crate::primitives::{hex_encode, ChainIdentity};
+use crate::primitives::{ChainIdentity, hex_encode};
 use crate::protocol::*;
-use crate::share::{verify_share, ClaimedWitnesses, ShareVerdict};
+use crate::share::{ShareVerdict, verify_share};
 use crate::telemetry::PoolTelemetry;
 
 /// Target seconds between shares per miner
@@ -238,16 +238,13 @@ pub struct PoolServer<T: TemplateProvider + Send + Sync + 'static> {
     job_manager: Arc<JobManager>,
     tp_client: Arc<T>,
     accounting: Arc<PoolAccounting>,
+    candidate_submission: tokio::sync::Mutex<()>,
     pool_key: SecretKey,
     pool_id: String,
     cfg: ChainConfig,
     bind_addr: SocketAddr,
     job_tx: broadcast::Sender<PoolBroadcast>,
     miners: Arc<RwLock<HashMap<[u8; 32], MinerSession>>>,
-    /// Witnesses already paid for on this pool. The node enforces single use
-    /// chain-wide; mirroring it here stops a replayed list from being credited
-    /// twice before the node ever sees it.
-    claimed_witnesses: Arc<RwLock<ClaimedWitnesses>>,
     /// GTM: per-IP connection counts for rate limiting
     ip_connections: Arc<RwLock<HashMap<std::net::IpAddr, usize>>>,
     /// Live loop state for `/api/pool/status`.
@@ -293,13 +290,13 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
             job_manager,
             tp_client,
             accounting,
+            candidate_submission: tokio::sync::Mutex::new(()),
             pool_key,
             pool_id,
             cfg,
             bind_addr,
             job_tx,
             miners: Arc::new(RwLock::new(HashMap::new())),
-            claimed_witnesses: Arc::new(RwLock::new(ClaimedWitnesses::default())),
             ip_connections: Arc::new(RwLock::new(HashMap::new())),
             telemetry: Arc::new(PoolTelemetry::new()),
         }
@@ -410,6 +407,12 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
             .accounting
             .get_view_public(&reward_spend_public)
             .unwrap_or([0u8; 32]);
+        crate::primitives::bind_reward(
+            &self.cfg,
+            &mut header,
+            &reward_view_public,
+            &reward_spend_public,
+        );
         let header_data = crate::wire_config(crate::DEFAULT_WIRE_BYTES)
             .serialize(&header)
             .map_err(|error| PoolError::Internal(format!("header serialisation: {error}")))?;
@@ -449,6 +452,9 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
     }
 
     pub async fn run(self: Arc<Self>) -> Result<(), PoolError> {
+        self.recover_pending_block()
+            .await
+            .map_err(PoolError::Internal)?;
         let listener = TcpListener::bind(self.bind_addr).await?;
         info!("Pool server listening on {}", self.bind_addr);
 
@@ -460,7 +466,6 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
         loop {
             let (stream, addr) = listener.accept().await?;
 
-            // ── GTM: per-IP connection limiting ──
             {
                 let mut ip_map = self.ip_connections.write();
                 let count = ip_map.entry(addr.ip()).or_insert(0);
@@ -527,9 +532,13 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
             }
 
             tokio::select! {
-                _ = poll_interval.tick() => {
+                  _ = poll_interval.tick() => {
+                    {
+                        let _submission = self.candidate_submission.lock().await;
+                        if let Err(error) = self.recover_pending_block().await { warn!("Pending block recovery: {error}"); }
+                    }
                     match self.tp_client.get_template().await {
-                        Ok(tpl) => self.apply_template(&tpl),
+                        Ok(tpl) => self.apply_template(tpl),
                         Err(e) => warn!("TP poll failed: {e}"),
                     }
                 }
@@ -538,7 +547,7 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                         Ok(env) if env.msg_type == TP_TEMPLATE => {
                             if let Ok(tpl) = BlockTemplate::decode(&env.payload[..]) {
                                 info!("Received pushed template update: height={}", tpl.height);
-                                self.apply_template(&tpl);
+                                self.apply_template(tpl);
                                 poll_interval.reset();
                             }
                         }
@@ -569,7 +578,7 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                         "Refreshed template after block accept: height={}",
                         tpl.height
                     );
-                    self.apply_template(&tpl);
+                    self.apply_template(tpl);
                     return;
                 }
                 Err(error) => {
@@ -587,7 +596,7 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
         warn!("Giving up on post-block template refresh; waiting for the node push");
     }
 
-    fn apply_template(&self, tpl: &BlockTemplate) {
+    fn apply_template(&self, tpl: BlockTemplate) {
         // The template protocol version is the node's, which is a different
         // contract from the miner-facing protocol version in `crate::protocol`.
         if tpl.protocol_version != hyphen_transport::POOL_PROTOCOL_VERSION
@@ -629,7 +638,7 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
             warn!("Rejected template whose header metadata does not match its envelope");
             return;
         }
-        match self.job_manager.ingest_template(tpl) {
+        match self.job_manager.ingest_owned_template(tpl) {
             Ok(job) => {
                 self.telemetry.record_job(&job);
                 let _ = self.job_tx.send(PoolBroadcast::NewTemplate);
@@ -725,6 +734,11 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
 
         {
             let mut miners = self.miners.write();
+            if miners.contains_key(&miner_pk) {
+                return Err(PoolError::Internal(
+                    "miner already has an active session".into(),
+                ));
+            }
             miners.insert(
                 miner_pk,
                 MinerSession {
@@ -754,7 +768,8 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
         self.accounting.register_view_key(wallet_addr, view_public);
         self.accounting.register_miner(miner_pk, wallet_addr);
 
-        let current_job = self.job_manager.current_job();
+        let mut job_rx = self.job_tx.subscribe();
+        let current_job = self.job_manager.shared_current_job();
         let (tip_hash, tip_height, block_diff) = match &current_job {
             Some(j) => (
                 j.header.prev_hash.as_bytes().to_vec(),
@@ -792,254 +807,256 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
             PoolCodec::write_envelope(&mut stream, &job_env).await?;
         }
 
-        let mut job_rx = self.job_tx.subscribe();
+        let (mut reader, mut writer) = stream.into_split();
+        'session: loop {
+            // Keep the partially read frame alive while sending pool broadcasts.
+            let mut incoming = std::pin::pin!(PoolCodec::read_envelope(&mut reader));
+            loop {
+                tokio::select! {
+                    result = &mut incoming => {
+                        let env = result?;
+                        env.verify()?;
 
-        loop {
-            tokio::select! {
-                result = PoolCodec::read_envelope(&mut stream) => {
-                    let env = result?;
-                    env.verify()?;
-
-                    if env.sender_pubkey.len() != 32 || env.sender_pubkey[..] != miner_pk[..] {
-                        return Err(PoolError::Internal("pubkey mismatch".into()));
-                    }
-
-                    match env.msg_type {
-                        MSG_SUBMIT => {
-                            if !self.register_submission_nonce(&miner_pk, env.nonce) {
-                                return Err(PoolError::Internal(
-                                    "duplicate or unauthenticated share envelope".into(),
-                                ));
-                            }
-                            let reply = self.handle_share(&env, &miner_pk).await;
-                            if reply.accepted {
-                                self.telemetry.record_share_accepted();
-                            } else {
-                                self.telemetry.record_share_rejected(&reply.error);
-                            }
-                            if reply.block_found {
-                                self.telemetry.record_block_submitted();
-                            }
-                            let reply_payload = reply.encode_to_vec();
-                            let (sequence, previous, receipt) = if reply.accepted {
-                                self.next_share_receipt(
-                                    &miner_pk,
-                                    &env.payload,
-                                    &reply_payload,
-                                )
-                            } else {
-                                (0, Vec::new(), Vec::new())
-                            };
-                            let reply_env = PoolEnvelope::sign_with_receipt(
-                                MSG_SUBMIT_RESULT,
-                                reply_payload,
-                                &self.pool_key,
-                                sequence,
-                                previous,
-                                receipt,
-                            );
-                            PoolCodec::write_envelope(&mut stream, &reply_env).await?;
-
-                            if reply.accepted {
-                                let new_diff = {
-                                    let mut miners = self.miners.write();
-                                    if let Some(session) = miners.get_mut(&miner_pk) {
-                                        let old_diff = session.vardiff.current_difficulty;
-                                        session.total_lifetime_shares += 1;
-                                        let result = session.vardiff.record_share_with_warmup(
-                                            session.total_lifetime_shares,
-                                            session.estimated_target_diff,
-                                        );
-                                        if result.is_some() {
-                                            // Maintain the difficulty floor as the minimum of the
-                                            // old floor and the outgoing difficulty. This ensures
-                                            // all in-flight shares mined at any difficulty within
-                                            // the grace window are still accepted.
-                                            let now = std::time::Instant::now();
-                                            if now.duration_since(session.floor_set_at).as_secs()
-                                                >= VARDIFF_GRACE_WINDOW_SECS
-                                            {
-                                                // Grace window expired — reset floor to old_diff
-                                                session.difficulty_floor = old_diff;
-                                            } else {
-                                                session.difficulty_floor =
-                                                    session.difficulty_floor.min(old_diff);
-                                            }
-                                            session.floor_set_at = now;
-                                        }
-                                        result
-                                    } else {
-                                        None
-                                    }
-                                };
-                                if let Some(diff) = new_diff {
-                                    info!(
-                                        "VarDiff: miner {} → share_diff={}",
-                                        hex_encode(miner_pk),
-                                        diff
-                                    );
-                                    let set_msg = SetDifficulty {
-                                        share_difficulty: diff,
-                                    };
-                                    let diff_env = PoolEnvelope::sign(
-                                        MSG_SET_DIFFICULTY,
-                                        set_msg.encode_to_vec(),
-                                        &self.pool_key,
-                                    );
-                                    PoolCodec::write_envelope(
-                                        &mut stream,
-                                        &diff_env,
-                                    )
-                                    .await?;
-
-                                    if let Some(job) = self.job_manager.current_job() {
-                                        let wallet = self.session_wallet(&miner_pk);
-                                        let template = self.build_job_template_for_miner(
-                                            &job,
-                                            true,
-                                            wallet,
-                                            miner_pk,
-                                            diff,
-                                        )?;
-                                        let job_env = PoolEnvelope::sign(
-                                            MSG_JOB,
-                                            template.encode_to_vec(),
-                                            &self.pool_key,
-                                        );
-                                        PoolCodec::write_envelope(&mut stream, &job_env).await?;
-                                    }
-                                }
-                            }
+                        if env.sender_pubkey.len() != 32 || env.sender_pubkey[..] != miner_pk[..] {
+                            return Err(PoolError::Internal("pubkey mismatch".into()));
                         }
-                        MSG_KEEPALIVE => {}
-                        MSG_COMPUTE_RATE_REPORT => {
-                            if let Ok(report) = ComputeRateReport::decode(&env.payload[..]) {
-                                info!(
-                                    "Scientific compute report from {}: {} ops/s, total={}, uptime={}s",
-                                    hex_encode(miner_pk),
-                                    report.operations_per_second,
-                                    report.total_operations,
-                                    report.uptime_secs,
-                                );
 
-                                let new_diff = {
-                                    let mut miners = self.miners.write();
-                                    miners.get_mut(&miner_pk).and_then(|session| {
-                                        // A report measured over an idle window
-                                        // says nothing about sustainable rate.
-                                        if report.operations_per_second == 0 {
-                                            return None;
-                                        }
-                                        // Same decision gate as the share-driven
-                                        // controller: one threshold change per
-                                        // interval, so the pool is not re-issuing
-                                        // jobs faster than miners can mine them.
-                                        let now_ms = hyphen_core::timestamp::ntp_adjusted_timestamp_ms();
-                                        if now_ms.saturating_sub(session.vardiff.last_retarget_ms)
-                                            < VARDIFF_MIN_RETARGET_MS
-                                        {
-                                            return None;
-                                        }
-                                        let recommended = Self::recommended_share_difficulty(&self.cfg,
-                                            report.operations_per_second,
-                                            session.thread_count,
-                                        );
-                                        let current = session.vardiff.current_difficulty.max(1);
-                                        let change_pct = (recommended as f64 - current as f64).abs()
-                                            / current as f64;
-                                        if change_pct >= VARDIFF_SIGNIFICANT_CHANGE {
-                                            let now = std::time::Instant::now();
-                                            if now.duration_since(session.floor_set_at).as_secs()
-                                                >= VARDIFF_GRACE_WINDOW_SECS
-                                            {
-                                                session.difficulty_floor = current;
-                                            } else {
-                                                session.difficulty_floor =
-                                                    session.difficulty_floor.min(current);
+                        match env.msg_type {
+                            MSG_SUBMIT => {
+                                if !self.register_submission_nonce(&miner_pk, env.nonce) {
+                                    return Err(PoolError::Internal(
+                                        "duplicate or unauthenticated share envelope".into(),
+                                    ));
+                                }
+                                let reply = self.handle_share(&env, &miner_pk).await;
+                                if reply.accepted {
+                                    self.telemetry.record_share_accepted();
+                                } else {
+                                    self.telemetry.record_share_rejected(&reply.error);
+                                }
+                                let reply_payload = reply.encode_to_vec();
+                                let (sequence, previous, receipt) = if reply.accepted {
+                                    self.next_share_receipt(
+                                        &miner_pk,
+                                        &env.payload,
+                                        &reply_payload,
+                                    )
+                                } else {
+                                    (0, Vec::new(), Vec::new())
+                                };
+                                let reply_env = PoolEnvelope::sign_with_receipt(
+                                    MSG_SUBMIT_RESULT,
+                                    reply_payload,
+                                    &self.pool_key,
+                                    sequence,
+                                    previous,
+                                    receipt,
+                                );
+                                PoolCodec::write_envelope(&mut writer, &reply_env).await?;
+
+                                if reply.accepted && !self.cfg.feature_enabled(hyphen_core::FEATURE_NEURAL_WORK) {
+                                    let new_diff = {
+                                        let mut miners = self.miners.write();
+                                        if let Some(session) = miners.get_mut(&miner_pk) {
+                                            let old_diff = session.vardiff.current_difficulty;
+                                            session.total_lifetime_shares += 1;
+                                            let result = session.vardiff.record_share_with_warmup(
+                                                session.total_lifetime_shares,
+                                                session.estimated_target_diff,
+                                            );
+                                            if result.is_some() {
+                                                // Maintain the difficulty floor as the minimum of the
+                                                // old floor and the outgoing difficulty. This ensures
+                                                // all in-flight shares mined at any difficulty within
+                                                // the grace window are still accepted.
+                                                let now = std::time::Instant::now();
+                                                if now.duration_since(session.floor_set_at).as_secs()
+                                                    >= VARDIFF_GRACE_WINDOW_SECS
+                                                {
+                                                    // Grace window expired — reset floor to old_diff
+                                                    session.difficulty_floor = old_diff;
+                                                } else {
+                                                    session.difficulty_floor =
+                                                        session.difficulty_floor.min(old_diff);
+                                                }
+                                                session.floor_set_at = now;
                                             }
-                                            session.floor_set_at = now;
-                                            session.vardiff.current_difficulty = recommended;
-                                            session.vardiff.share_timestamps.clear();
-                                            session.vardiff.last_retarget_ms = now_ms;
-                                            Some(recommended)
+                                            result
                                         } else {
                                             None
                                         }
-                                    })
-                                };
-
-                                if let Some(diff) = new_diff {
-                                    info!(
-                                        "Checkpoint update: miner {} -> iterations={} (compute={} ops/s)",
-                                        hex_encode(miner_pk),
-                                        diff,
-                                        report.operations_per_second,
-                                    );
-                                    let set_msg = SetDifficulty {
-                                        share_difficulty: diff,
                                     };
-                                    let diff_env = PoolEnvelope::sign(
-                                        MSG_SET_DIFFICULTY,
-                                        set_msg.encode_to_vec(),
-                                        &self.pool_key,
-                                    );
-                                    PoolCodec::write_envelope(&mut stream, &diff_env).await?;
-
-                                    if let Some(job) = self.job_manager.current_job() {
-                                        let wallet = self.session_wallet(&miner_pk);
-                                        let template = self.build_job_template_for_miner(
-                                            &job,
-                                            true,
-                                            wallet,
-                                            miner_pk,
-                                            diff,
-                                        )?;
-                                        let job_env = PoolEnvelope::sign(
-                                            MSG_JOB,
-                                            template.encode_to_vec(),
+                                    if let Some(diff) = new_diff {
+                                        info!(
+                                            "VarDiff: miner {} → share_diff={}",
+                                            hex_encode(miner_pk),
+                                            diff
+                                        );
+                                        let set_msg = SetDifficulty {
+                                            share_difficulty: diff,
+                                        };
+                                        let diff_env = PoolEnvelope::sign(
+                                            MSG_SET_DIFFICULTY,
+                                            set_msg.encode_to_vec(),
                                             &self.pool_key,
                                         );
-                                        PoolCodec::write_envelope(&mut stream, &job_env).await?;
+                                        PoolCodec::write_envelope(
+                                            &mut writer,
+                                            &diff_env,
+                                        )
+                                        .await?;
+
+                                        if let Some(job) = self.job_manager.shared_current_job() {
+                                            let wallet = self.session_wallet(&miner_pk);
+                                            let template = self.build_job_template_for_miner(
+                                                &job,
+                                                true,
+                                                wallet,
+                                                miner_pk,
+                                                diff,
+                                            )?;
+                                            let job_env = PoolEnvelope::sign(
+                                                MSG_JOB,
+                                                template.encode_to_vec(),
+                                                &self.pool_key,
+                                            );
+                                            PoolCodec::write_envelope(&mut writer, &job_env).await?;
+                                        }
                                     }
                                 }
                             }
-                        }
-                        _ => {
-                            warn!("Unexpected msg type {} from {addr}", env.msg_type);
-                        }
-                    }
-                }
+                            MSG_KEEPALIVE => {}
+                            MSG_COMPUTE_RATE_REPORT if !self.cfg.feature_enabled(hyphen_core::FEATURE_NEURAL_WORK) => {
+                                if let Ok(report) = ComputeRateReport::decode(&env.payload[..]) {
+                                    info!(
+                                        "Scientific compute report from {}: {} ops/s, total={}, uptime={}s",
+                                        hex_encode(miner_pk),
+                                        report.operations_per_second,
+                                        report.total_operations,
+                                        report.uptime_secs,
+                                    );
 
-                frame = job_rx.recv() => {
-                    match frame {
-                        Ok(PoolBroadcast::NewTemplate) => {
-                            if let Some(job) = self.job_manager.current_job() {
-                                let wallet = self.session_wallet(&miner_pk);
-                                let diff = self.session_share_difficulty(&miner_pk, job.share_difficulty);
-                                let template = self.build_job_template_for_miner(
-                                    &job,
-                                    true,
-                                    wallet,
-                                    miner_pk,
-                                    diff,
-                                )?;
-                                let env = PoolEnvelope::sign(MSG_JOB, template.encode_to_vec(), &self.pool_key);
-                                PoolCodec::write_envelope(&mut stream, &env).await?;
+                                    let new_diff = {
+                                        let mut miners = self.miners.write();
+                                        miners.get_mut(&miner_pk).and_then(|session| {
+                                            // A report measured over an idle window
+                                            // says nothing about sustainable rate.
+                                            if report.operations_per_second == 0 {
+                                                return None;
+                                            }
+                                            // Same decision gate as the share-driven
+                                            // controller: one threshold change per
+                                            // interval, so the pool is not re-issuing
+                                            // jobs faster than miners can mine them.
+                                            let now_ms = hyphen_core::timestamp::ntp_adjusted_timestamp_ms();
+                                            if now_ms.saturating_sub(session.vardiff.last_retarget_ms)
+                                                < VARDIFF_MIN_RETARGET_MS
+                                            {
+                                                return None;
+                                            }
+                                            let recommended = Self::recommended_share_difficulty(&self.cfg,
+                                                report.operations_per_second,
+                                                session.thread_count,
+                                            );
+                                            let current = session.vardiff.current_difficulty.max(1);
+                                            let change_pct = (recommended as f64 - current as f64).abs()
+                                                / current as f64;
+                                            if change_pct >= VARDIFF_SIGNIFICANT_CHANGE {
+                                                let now = std::time::Instant::now();
+                                                if now.duration_since(session.floor_set_at).as_secs()
+                                                    >= VARDIFF_GRACE_WINDOW_SECS
+                                                {
+                                                    session.difficulty_floor = current;
+                                                } else {
+                                                    session.difficulty_floor =
+                                                        session.difficulty_floor.min(current);
+                                                }
+                                                session.floor_set_at = now;
+                                                session.vardiff.current_difficulty = recommended;
+                                                session.vardiff.share_timestamps.clear();
+                                                session.vardiff.last_retarget_ms = now_ms;
+                                                Some(recommended)
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                    };
+
+                                    if let Some(diff) = new_diff {
+                                        info!(
+                                            "Checkpoint update: miner {} -> iterations={} (compute={} ops/s)",
+                                            hex_encode(miner_pk),
+                                            diff,
+                                            report.operations_per_second,
+                                        );
+                                        let set_msg = SetDifficulty {
+                                            share_difficulty: diff,
+                                        };
+                                        let diff_env = PoolEnvelope::sign(
+                                            MSG_SET_DIFFICULTY,
+                                            set_msg.encode_to_vec(),
+                                            &self.pool_key,
+                                        );
+                                        PoolCodec::write_envelope(&mut writer, &diff_env).await?;
+
+                                        if let Some(job) = self.job_manager.shared_current_job() {
+                                            let wallet = self.session_wallet(&miner_pk);
+                                            let template = self.build_job_template_for_miner(
+                                                &job,
+                                                true,
+                                                wallet,
+                                                miner_pk,
+                                                diff,
+                                            )?;
+                                            let job_env = PoolEnvelope::sign(
+                                                MSG_JOB,
+                                                template.encode_to_vec(),
+                                                &self.pool_key,
+                                            );
+                                            PoolCodec::write_envelope(&mut writer, &job_env).await?;
+                                        }
+                                    }
+                                }
+                            }
+                            MSG_COMPUTE_RATE_REPORT => {}
+                            _ => {
+                                warn!("Unexpected msg type {} from {addr}", env.msg_type);
                             }
                         }
-                        Ok(PoolBroadcast::BlockFound(notify)) => {
-                            let notify_env = PoolEnvelope::sign(
-                                MSG_BLOCK_FOUND,
-                                notify.encode_to_vec(),
-                                &self.pool_key,
-                            );
-                            PoolCodec::write_envelope(&mut stream, &notify_env).await?;
-                        }
-                        Err(broadcast::error::RecvError::Lagged(n)) => {
-                            warn!("Miner {addr} lagged {n} broadcasts");
-                        }
-                        Err(broadcast::error::RecvError::Closed) => {
-                            break;
+                        break;
+                    }
+
+                    frame = job_rx.recv() => {
+                        match frame {
+                            Ok(PoolBroadcast::NewTemplate) => {
+                                if let Some(job) = self.job_manager.shared_current_job() {
+                                    let wallet = self.session_wallet(&miner_pk);
+                                    let diff = self.session_share_difficulty(&miner_pk, job.share_difficulty);
+                                    let template = self.build_job_template_for_miner(
+                                        &job,
+                                        true,
+                                        wallet,
+                                        miner_pk,
+                                        diff,
+                                    )?;
+                                    let env = PoolEnvelope::sign(MSG_JOB, template.encode_to_vec(), &self.pool_key);
+                                    PoolCodec::write_envelope(&mut writer, &env).await?;
+                                }
+                            }
+                            Ok(PoolBroadcast::BlockFound(notify)) => {
+                                let notify_env = PoolEnvelope::sign(
+                                    MSG_BLOCK_FOUND,
+                                    notify.encode_to_vec(),
+                                    &self.pool_key,
+                                );
+                                PoolCodec::write_envelope(&mut writer, &notify_env).await?;
+                            }
+                            Err(broadcast::error::RecvError::Lagged(n)) => {
+                                warn!("Miner {addr} lagged {n} broadcasts");
+                            }
+                            Err(broadcast::error::RecvError::Closed) => {
+                                break 'session;
+                            }
                         }
                     }
                 }
@@ -1076,7 +1093,7 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
         }
         job_id.copy_from_slice(&submission.job_id);
 
-        let job = match self.job_manager.get_job(&job_id) {
+        let job = match self.job_manager.shared_job(&job_id) {
             Some(j) => j,
             None => {
                 return SubmitResult {
@@ -1088,7 +1105,7 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
             }
         };
 
-        if let Some(current_job) = self.job_manager.current_job() {
+        if let Some(current_job) = self.job_manager.shared_current_job() {
             let chain_advanced = current_job.header.height != job.header.height
                 || current_job.header.prev_hash != job.header.prev_hash;
             if chain_advanced && current_job.job_id != job.job_id {
@@ -1166,21 +1183,6 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                 &submission.witnesses,
             )
         } else {
-            // Only another miner's witnesses are refused. The submitting miner
-            // is allowed to extend a list it already submitted as a credit
-            // share, which is how a block candidate is built.
-            let claimed = self.claimed_witnesses.read();
-            if let Some(duplicate) = claimed.claimed_by_other(miner_pk, &submission.witnesses) {
-                return SubmitResult {
-                    accepted: false,
-                    error: format!(
-                        "witness {duplicate} was already claimed by another miner on this pool"
-                    ),
-                    block_found: false,
-                    block_hash: Vec::new(),
-                };
-            }
-            drop(claimed);
             verify_share(
                 &effective_header,
                 job.chain_length,
@@ -1231,6 +1233,12 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                 }
 
                 let mut authorized_header = effective_header.clone();
+                crate::primitives::bind_reward(
+                    &self.cfg,
+                    &mut authorized_header,
+                    &expected_view,
+                    &reward_recipient,
+                );
                 authorized_header.pow_commitment = commitment;
                 if let Err(error) = authorization.verify(
                     &authorized_header,
@@ -1246,19 +1254,36 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                     };
                 }
 
-                if !self.job_manager.try_begin_block_submission(job.job_id) {
+                let Some(_lease) = self.job_manager.try_begin_block_submission(job.job_id) else {
                     return SubmitResult {
                         accepted: false,
                         error: "stale job".into(),
                         block_found: false,
                         block_hash: Vec::new(),
                     };
+                };
+                let _submission = self.candidate_submission.lock().await;
+                if let Err(error) = self.recover_pending_block().await {
+                    return SubmitResult {
+                        error,
+                        ..Default::default()
+                    };
                 }
-                if !neural {
-                    let mut claimed = self.claimed_witnesses.write();
-                    claimed.claim(miner_pk, &submission.witnesses);
-                    self.telemetry.set_claimed_witnesses(claimed.len());
-                }
+                let credited = if neural {
+                    effective_header.difficulty
+                } else {
+                    match self.credit_witnesses(
+                        miner_pk,
+                        wallet_address,
+                        &submission.witnesses,
+                        &effective_header,
+                    ) {
+                        Ok(fresh) => fresh,
+                        Err(rejection) => {
+                            return rejection;
+                        }
+                    }
+                };
 
                 let wallet_hex = {
                     let miners = self.miners.read();
@@ -1275,23 +1300,8 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                     commitment
                 );
 
-                if credit_at == effective_header.difficulty {
-                    self.accounting.record_valid_share(
-                        *miner_pk,
-                        wallet_address,
-                        credit_at,
-                        effective_header.difficulty,
-                        effective_header.reward,
-                        effective_header.total_fee,
-                    );
-                }
-
                 // The miner signed this exact header, so it is the block header.
                 let mined_header = authorized_header;
-                let block_height = mined_header.height;
-                let block_reward = mined_header.reward;
-                let block_total_fee = mined_header.total_fee;
-                let block_difficulty = mined_header.difficulty;
 
                 let block = Block {
                     header: mined_header,
@@ -1304,74 +1314,40 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                 let block_hash = block.hash();
                 info!("Submitting block {} to the node", block_hash);
 
-                let block_data = match crate::wire_config(8 * 1024 * 1024).serialize(&block) {
-                    Ok(data) => data,
-                    Err(error) => {
-                        self.job_manager.finish_block_submission(job.job_id);
-                        return SubmitResult {
-                            accepted: false,
-                            error: format!("block encoding failed: {error}"),
-                            block_found: false,
-                            block_hash: Vec::new(),
-                        };
-                    }
+                let candidate = PendingBlock {
+                    block,
+                    wallet: wallet_address,
                 };
-                let tp = Arc::clone(&self.tp_client);
-                let self_ref = Arc::clone(self);
-                let job_id = job.job_id;
-                let submit_hash = block_hash;
-                let finder_pubkey = *miner_pk;
-                let payout_wallet = wallet_address;
-                tokio::spawn(async move {
-                    match tp.submit_block(block_data).await {
-                        Ok(result) => {
-                            if result.accepted {
-                                info!("Block {} accepted by node", submit_hash);
-                                self_ref.telemetry.record_block_settled(
-                                    block_height,
-                                    submit_hash.to_string(),
-                                    true,
-                                    "",
-                                );
-                                // The job is finished the moment the node takes
-                                // the block: release the claim before anything
-                                // else, so a slow or failing template refresh
-                                // cannot leave the pool unable to accept the
-                                // next candidate.
-                                self_ref.job_manager.finish_block_submission(job_id);
-                                self_ref.accounting.settle_block(
-                                    finder_pubkey,
-                                    payout_wallet,
-                                    block_height,
-                                    submit_hash.to_string(),
-                                    block_reward,
-                                    block_total_fee,
-                                    block_difficulty,
-                                );
-                                self_ref.refresh_template_after_block().await;
-                            } else {
-                                warn!("Block rejected by node: {}", result.error);
-                                self_ref.telemetry.record_block_settled(
-                                    block_height,
-                                    submit_hash.to_string(),
-                                    false,
-                                    &result.error,
-                                );
-                                self_ref.job_manager.finish_block_submission(job_id);
-                            }
+                let bytes =
+                    match crate::wire_config(self.cfg.max_block_size).serialize(&candidate.block) {
+                        Ok(bytes) => bytes,
+                        Err(error) => {
+                            return SubmitResult {
+                                accepted: !neural && credited > 0,
+                                error: error.to_string(),
+                                ..Default::default()
+                            };
                         }
-                        Err(e) => {
-                            self_ref.telemetry.record_block_settled(
-                                block_height,
-                                submit_hash.to_string(),
-                                false,
-                                &e.to_string(),
-                            );
-                            self_ref.job_manager.finish_block_submission(job_id);
-                            error!("Failed to submit block to node: {e}");
-                        }
-                    }
-                });
+                    };
+                let result = match self.accounting.stage_block(&candidate) {
+                    Ok(()) => self.submit_pending_block(&candidate, bytes).await,
+                    Err(error) => Err(error.to_string()),
+                };
+                let error = match result {
+                    Ok(reply) if !reply.accepted => Some(reply.error),
+                    Ok(_) => None,
+                    Err(error) => Some(error),
+                };
+                if let Some(error) = error {
+                    warn!("Block {block_hash} submission: {error}");
+                    return SubmitResult {
+                        accepted: !neural && credited > 0,
+                        error,
+                        ..Default::default()
+                    };
+                }
+                let server = Arc::clone(self);
+                tokio::spawn(async move { server.refresh_template_after_block().await });
 
                 {
                     let mut miners = self.miners.write();
@@ -1412,12 +1388,15 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                         block_hash: Vec::new(),
                     };
                 }
-                let (credited, claimed_total) = {
-                    let mut claimed = self.claimed_witnesses.write();
-                    let credited = claimed.claim(miner_pk, &submission.witnesses);
-                    (credited, claimed.len())
+                let credited = match self.credit_witnesses(
+                    miner_pk,
+                    wallet_address,
+                    &submission.witnesses,
+                    &effective_header,
+                ) {
+                    Ok(fresh) => fresh,
+                    Err(rejection) => return rejection,
                 };
-                self.telemetry.set_claimed_witnesses(claimed_total);
                 if credited == 0 {
                     return SubmitResult {
                         accepted: false,
@@ -1426,14 +1405,6 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                         block_hash: Vec::new(),
                     };
                 }
-                self.accounting.record_valid_share(
-                    *miner_pk,
-                    wallet_address,
-                    credited,
-                    effective_header.difficulty,
-                    effective_header.reward,
-                    effective_header.total_fee,
-                );
                 {
                     let mut miners = self.miners.write();
                     if let Some(session) = miners.get_mut(miner_pk) {
@@ -1465,11 +1436,177 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
             }
         }
     }
+
+    /// Called before listening and under the submission mutex while serving miners.
+    async fn recover_pending_block(&self) -> Result<(), String> {
+        if let Some(candidate) = self.accounting.pending_block().map_err(|e| e.to_string())? {
+            info!("Recovering pending block {}", candidate.block.hash());
+            let bytes = crate::wire_config(self.cfg.max_block_size)
+                .serialize(&candidate.block)
+                .map_err(|e| e.to_string())?;
+            self.submit_pending_block(&candidate, bytes).await?;
+        }
+        Ok(())
+    }
+
+    async fn submit_pending_block(
+        &self,
+        candidate: &PendingBlock,
+        bytes: Vec<u8>,
+    ) -> Result<crate::tp::SubmitBlockResult, String> {
+        let hash = candidate.block.hash();
+        let header = &candidate.block.header;
+        self.telemetry.record_block_submitted();
+        let reply = self
+            .tp_client
+            .submit_block(bytes)
+            .await
+            .map_err(|e| e.to_string())?;
+        if reply.block_hash.as_slice() != hash.as_bytes() {
+            return Err("node acknowledged a different block hash".into());
+        }
+        if reply.accepted {
+            self.accounting
+                .settle_accepted_block(candidate)
+                .map_err(|e| e.to_string())?;
+        } else {
+            self.accounting
+                .discard_block(&hash.to_string())
+                .map_err(|e| e.to_string())?;
+        }
+        self.telemetry.record_block_settled(
+            header.height,
+            hash.to_string(),
+            reply.accepted,
+            &reply.error,
+        );
+        Ok(reply)
+    }
+
+    fn credit_witnesses(
+        &self,
+        miner: &[u8; 32],
+        wallet: [u8; 32],
+        witnesses: &[u64],
+        header: &crate::primitives::BlockHeader,
+    ) -> Result<u64, SubmitResult> {
+        let (fresh, count) = self
+            .accounting
+            .credit_witnesses(*miner, wallet, witnesses, header.difficulty, header.reward)
+            .map_err(|error| SubmitResult {
+                error: error.to_string(),
+                ..Default::default()
+            })?;
+        self.telemetry.set_claimed_witnesses(count);
+        Ok(fresh)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn lost_node_acknowledgement_is_recovered_after_reopening_the_pool() {
+        use crate::accounting::{PoolAccountingConfig, PoolMode};
+        use crate::template::TemplateProviderClient;
+        use crate::tp::{
+            SignedEnvelope, SubmitBlockRequest, SubmitBlockResult, TP_SUBMIT_RESULT, read_envelope,
+            write_envelope,
+        };
+
+        let cfg = ChainConfig::neural_devnet();
+        let wallet = [7; 32];
+        let mut block = crate::primitives::build_genesis_block(&cfg);
+        block.header.height = 1;
+        block.header.reward = 123;
+        block.header.miner_pubkey = [9; 32];
+        let hash = block.hash();
+        let expected_bytes = crate::wire_config(cfg.max_block_size)
+            .serialize(&block)
+            .unwrap();
+        let candidate = PendingBlock { wallet, block };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let peer = tokio::spawn(async move {
+            // First connection and its transport retry lose the reply. The restarted
+            // pool contacts the peer a third time with exactly the same signed block.
+            for attempt in 0..3 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_envelope(&mut stream).await.unwrap();
+                assert_eq!(request.msg_type, crate::tp::TP_SUBMIT_BLOCK);
+                assert_eq!(
+                    SubmitBlockRequest::decode(request.payload.as_slice())
+                        .unwrap()
+                        .block_data,
+                    expected_bytes
+                );
+                if attempt == 2 {
+                    let reply = SubmitBlockResult {
+                        accepted: true,
+                        block_hash: hash.as_bytes().to_vec(),
+                        error: String::new(),
+                    };
+                    let env = SignedEnvelope::sign(
+                        TP_SUBMIT_RESULT,
+                        reply.encode_to_vec(),
+                        &SecretKey([8; 32]),
+                    );
+                    write_envelope(&mut stream, &env).await.unwrap();
+                }
+            }
+        });
+        let dir =
+            std::env::temp_dir().join(format!("hyphen-pending-block-{}", crate::random_u64()));
+        let config = PoolAccountingConfig {
+            mode: PoolMode::Solo,
+            pool_fee_bps: 0,
+            pool_wallet: wallet,
+            pool_view_public: [0; 32],
+            network_magic: cfg.network_magic,
+            pplns_window_factor: 2,
+            state_dir: Some(dir.clone()),
+        };
+        for restarted in [false, true] {
+            let ledger = Arc::new(PoolAccounting::try_new(config.clone()).unwrap());
+            let sk = SecretKey([3; 32]);
+            let client = TemplateProviderClient::connect(&addr, &sk, &cfg)
+                .await
+                .unwrap();
+            let pool = PoolServer::new(
+                Arc::new(JobManager::new(1)),
+                Arc::new(client),
+                Arc::clone(&ledger),
+                sk,
+                "test".into(),
+                cfg.clone(),
+                "127.0.0.1:0".parse().unwrap(),
+            );
+            if !restarted {
+                ledger.stage_block(&candidate).unwrap();
+                assert!(pool.recover_pending_block().await.is_err());
+                assert_eq!(ledger.wallet_summary(wallet, 2).valid_shares, 0);
+                assert!(ledger.pending_block().unwrap().is_some());
+            } else {
+                pool.recover_pending_block().await.unwrap();
+                pool.recover_pending_block().await.unwrap();
+                assert!(ledger.pending_block().unwrap().is_none());
+            }
+        }
+        peer.await.unwrap();
+        let summary = PoolAccounting::try_new(config)
+            .unwrap()
+            .wallet_summary(wallet, 2);
+        assert_eq!(
+            (
+                summary.valid_shares,
+                summary.total_blocks_found,
+                summary.direct_reward_atomic
+            ),
+            (1, 1, 123)
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn vardiff_warmup_never_exceeds_consensus_iterations() {

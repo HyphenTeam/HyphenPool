@@ -219,9 +219,8 @@ impl PoolTelemetry {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn set_claimed_witnesses(&self, claimed: usize) {
-        self.claimed_witnesses
-            .store(claimed as u64, Ordering::Relaxed);
+    pub fn set_claimed_witnesses(&self, claimed: u64) {
+        self.claimed_witnesses.fetch_max(claimed, Ordering::Relaxed);
     }
 
     pub fn report(&self) -> StatusReport {

@@ -6,8 +6,8 @@ use prost::Message;
 use tracing::{info, warn};
 
 use crate::primitives::{
-    blake3_hash, blake3_hash_many, hex_encode, Block, BlockHeader, ChainConfig, ChainIdentity,
-    Hash256, SecretKey,
+    Block, BlockHeader, ChainConfig, ChainIdentity, Hash256, SecretKey, blake3_hash,
+    blake3_hash_many, hex_encode,
 };
 use crate::share::ClaimedWitnesses;
 use crate::tp::*;
@@ -319,7 +319,10 @@ impl ChainState {
         };
         self.claimed_witnesses
             .write()
-            .claim(&[0u8; 32], &block.pow_witnesses);
+            .claim(&[0u8; 32], &block.pow_witnesses)
+            .map_err(|witness| {
+                format!("proof of work rejected: witness {witness} was already claimed")
+            })?;
 
         {
             let mut history = self.history.write();

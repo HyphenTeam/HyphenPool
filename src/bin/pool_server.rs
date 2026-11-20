@@ -8,11 +8,10 @@ use tracing::info;
 use hyphen_pool::accounting::{PoolAccounting, PoolAccountingConfig, PoolMode};
 use hyphen_pool::api::{load_tls_identity, start_pool_api};
 use hyphen_pool::job::JobManager;
-use hyphen_pool::payout::{load_token_file, PayoutAgentClient, PayoutWorker, PayoutWorkerConfig};
-use hyphen_pool::primitives::{hex_encode, ChainConfig, SecretKey};
+use hyphen_pool::payout::{PayoutAgentClient, PayoutWorker, PayoutWorkerConfig, load_token_file};
+use hyphen_pool::primitives::{ChainConfig, SecretKey, hex_encode};
 use hyphen_pool::server::PoolServer;
 use hyphen_pool::template::TemplateProviderClient;
-use hyphen_pool::tp::TemplateProvider;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -42,7 +41,7 @@ struct Cli {
     /// Network selection (mainnet | testnet | devnet | neural-devnet)
     #[arg(
         long,
-        value_parser = ["mainnet", "testnet", "devnet", "neural-devnet"],
+        value_parser = ["mainnet", "testnet", "devnet", "neural-devnet", "contract-devnet"],
         default_value = "devnet"
     )]
     network: String,
@@ -125,6 +124,12 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Print one block's original reward and miner allocations from a closed ledger.
+    BlockCredits {
+        #[arg(long)]
+        state_dir: PathBuf,
+        block_hash: String,
+    },
     /// Generate a new Ed25519 key pair and save to file
     Keygen {
         /// Output file path for the 32-byte secret key
@@ -146,17 +151,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cli = Cli::parse();
 
+    if let Some(Commands::BlockCredits {
+        state_dir,
+        block_hash,
+    }) = &cli.command
+    {
+        let record = hyphen_pool::accounting::read_block_credits(state_dir, block_hash)?;
+        println!("{}", serde_json::to_string_pretty(&record)?);
+        return Ok(());
+    }
+
     if let Some(Commands::Keygen { output, force }) = &cli.command {
         let path = PathBuf::from(output);
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).map_err(|error| {
-                    format!(
-                        "cannot create key directory '{}': {error}",
-                        parent.display()
-                    )
-                })?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                format!(
+                    "cannot create key directory '{}': {error}",
+                    parent.display()
+                )
+            })?;
         }
         let sk = SecretKey::generate();
         write_secret_key(&path, &sk.0, *force)?;
@@ -172,11 +187,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "testnet" => ChainConfig::testnet(),
         "devnet" => ChainConfig::devnet(),
         "neural-devnet" => ChainConfig::neural_devnet(),
+        "contract-devnet" => ChainConfig {
+            network_name: "hyphen-contract-devnet-v1".into(),
+            network_magic: *b"HYCD",
+            consensus_features: hyphen_core::FEATURE_WASM
+                | hyphen_pool::primitives::FEATURE_ASSET_RULES_V1,
+            ..ChainConfig::devnet()
+        },
         _ => unreachable!("clap validates network"),
     };
 
     if cli.share_difficulty == 0 {
         return Err("--share-difficulty must be greater than zero".into());
+    }
+    if cfg.feature_enabled(hyphen_core::FEATURE_NEURAL_WORK) && cli.payout_mode != PoolMode::Solo {
+        return Err(
+            "neural work requires --payout-mode solo because each share is a full block candidate"
+                .into(),
+        );
     }
     if cli.standalone {
         return Err(
@@ -271,6 +299,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         pplns_window_factor: cli.pplns_window_factor,
         state_dir: Some(PathBuf::from(&cli.pool_state_dir)),
     })?);
+    if accounting.mode() != cli.payout_mode {
+        return Err(format!(
+            "pool ledger uses {} but --payout-mode is {}",
+            accounting.mode(),
+            cli.payout_mode
+        )
+        .into());
+    }
     let job_manager = Arc::new(JobManager::with_pool_pubkey(
         cli.share_difficulty,
         pool_pubkey,
@@ -313,7 +349,7 @@ async fn run_with_node(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn start_pool<T: TemplateProvider + Send + Sync + 'static>(
+async fn start_pool(
     cli: Cli,
     cfg: ChainConfig,
     sk: SecretKey,
@@ -321,7 +357,7 @@ async fn start_pool<T: TemplateProvider + Send + Sync + 'static>(
     api_addr: SocketAddr,
     job_manager: Arc<JobManager>,
     accounting: Arc<PoolAccounting>,
-    tp: Arc<T>,
+    tp: Arc<TemplateProviderClient>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let payout_handle = if cli.payout_mode != PoolMode::Solo {
         let endpoint: SocketAddr = cli
@@ -342,9 +378,21 @@ async fn start_pool<T: TemplateProvider + Send + Sync + 'static>(
             },
         )?;
         worker.verify_agent().await?;
-        Some(tokio::spawn(worker.run()))
+        tokio::spawn(worker.with_reward_source(Arc::clone(&tp)).run())
     } else {
-        None
+        let ledger = Arc::clone(&accounting);
+        let source = Arc::clone(&tp);
+        let interval = cfg.block_time / 2;
+        tokio::spawn(async move {
+            let mut ticks = tokio::time::interval(interval);
+            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticks.tick().await;
+                if let Err(error) = source.reconcile_rewards(&ledger).await {
+                    tracing::warn!(%error, "SOLO reward reconciliation failed");
+                }
+            }
+        })
     };
 
     let pool = Arc::new(PoolServer::new(
@@ -387,10 +435,8 @@ async fn start_pool<T: TemplateProvider + Send + Sync + 'static>(
     // Dropping the API closes its listener; the pool loop has ended, so the
     // process is on its way down and nothing should still be served.
     drop(api);
-    if let Some(h) = payout_handle {
-        h.abort();
-        let _ = h.await;
-    }
+    payout_handle.abort();
+    let _ = payout_handle.await;
 
     Ok(())
 }

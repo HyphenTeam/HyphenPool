@@ -2,7 +2,7 @@
 //! commitment and re-applies the node's predicate, so a miner cannot buy credit
 //! for work it did not do.
 
-use crate::primitives::{vms, BlockHeader, Hash256, FROZEN_BLOCK_VERSION};
+use crate::primitives::{BlockHeader, FROZEN_BLOCK_VERSION, Hash256, vms};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ShareVerdict {
@@ -144,14 +144,17 @@ impl ClaimedWitnesses {
 
     /// Claims every witness of an accepted submission for `claimant`. Returns
     /// the ones that were new, which is exactly the credit the miner earned.
-    pub fn claim(&mut self, claimant: &[u8; 32], witnesses: &[u64]) -> u64 {
+    pub fn claim(&mut self, claimant: &[u8; 32], witnesses: &[u64]) -> Result<u64, u64> {
+        if let Some(conflict) = self.claimed_by_other(claimant, witnesses) {
+            return Err(conflict);
+        }
         let mut fresh = 0;
         for witness in witnesses {
             if self.claimed.insert(*witness, *claimant).is_none() {
                 fresh += 1;
             }
         }
-        fresh
+        Ok(fresh)
     }
 
     pub fn len(&self) -> usize {
@@ -351,9 +354,9 @@ mod tests {
     fn duplicate_witnesses_earn_credit_once() {
         const MINER: [u8; 32] = [7; 32];
         let mut claimed = ClaimedWitnesses::default();
-        assert_eq!(claimed.claim(&MINER, &[3, 11]), 2);
-        assert_eq!(claimed.claim(&MINER, &[3, 11]), 0);
-        assert_eq!(claimed.claim(&MINER, &[11, 13]), 1);
+        assert_eq!(claimed.claim(&MINER, &[3, 11]), Ok(2));
+        assert_eq!(claimed.claim(&MINER, &[3, 11]), Ok(0));
+        assert_eq!(claimed.claim(&MINER, &[11, 13]), Ok(1));
         assert!(claimed.contains(13));
         assert_eq!(claimed.len(), 3);
     }
@@ -365,10 +368,14 @@ mod tests {
         const MINER: [u8; 32] = [7; 32];
         const OTHER: [u8; 32] = [9; 32];
         let mut claimed = ClaimedWitnesses::default();
-        assert_eq!(claimed.claim(&MINER, &[3, 11]), 2);
+        assert_eq!(claimed.claimed_by_other(&OTHER, &[5, 11, 13]), None);
+        assert_eq!(claimed.claim(&MINER, &[3, 11]), Ok(2));
+        assert_eq!(claimed.claim(&OTHER, &[5, 11, 13]), Err(11));
+        assert!(!claimed.contains(5));
+        assert!(!claimed.contains(13));
 
         assert_eq!(claimed.claimed_by_other(&MINER, &[3, 11, 13]), None);
         assert_eq!(claimed.claimed_by_other(&OTHER, &[3, 11, 13]), Some(3));
-        assert_eq!(claimed.claim(&MINER, &[3, 11, 13]), 1);
+        assert_eq!(claimed.claim(&MINER, &[3, 11, 13]), Ok(1));
     }
 }

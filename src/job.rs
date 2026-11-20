@@ -1,5 +1,6 @@
 use parking_lot::RwLock;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::info;
 
@@ -31,9 +32,27 @@ pub struct ActiveJob {
 
 pub struct JobManager {
     share_difficulty: u64,
-    current_job: RwLock<Option<ActiveJob>>,
-    jobs: RwLock<HashMap<[u8; 32], ActiveJob>>,
-    blocked_jobs: RwLock<HashMap<[u8; 32], std::time::Instant>>,
+    current_job: RwLock<Option<Arc<ActiveJob>>>,
+    jobs: RwLock<HashMap<[u8; 32], Arc<ActiveJob>>>,
+    blocked_jobs: RwLock<HashMap<[u8; 32], Arc<Instant>>>,
+}
+
+pub struct SubmissionLease {
+    manager: Arc<JobManager>,
+    job_id: [u8; 32],
+    started: Arc<Instant>,
+}
+
+impl Drop for SubmissionLease {
+    fn drop(&mut self) {
+        let mut blocked = self.manager.blocked_jobs.write();
+        if blocked
+            .get(&self.job_id)
+            .is_some_and(|owner| Arc::ptr_eq(owner, &self.started))
+        {
+            blocked.remove(&self.job_id);
+        }
+    }
 }
 
 impl JobManager {
@@ -52,6 +71,14 @@ impl JobManager {
     }
 
     pub fn ingest_template(&self, tpl: &BlockTemplate) -> Result<ActiveJob, String> {
+        self.ingest_owned_template(tpl.clone())
+            .map(Arc::unwrap_or_clone)
+    }
+
+    pub(crate) fn ingest_owned_template(
+        &self,
+        tpl: BlockTemplate,
+    ) -> Result<Arc<ActiveJob>, String> {
         let header: BlockHeader = crate::wire_config(4096)
             .deserialize(&tpl.header_data)
             .map_err(|e| format!("header deserialise: {e}"))?;
@@ -67,10 +94,10 @@ impl JobManager {
 
         {
             let current = self.current_job.read();
-            if let Some(ref current_job) = *current {
-                if current_job.job_id == template_id {
-                    return Ok(current_job.clone());
-                }
+            if let Some(ref current_job) = *current
+                && current_job.job_id == template_id
+            {
+                return Ok(current_job.clone());
             }
         }
 
@@ -81,10 +108,10 @@ impl JobManager {
                 .map_err(|_| "template epoch seed must be exactly 32 bytes")?,
         );
 
-        let job = ActiveJob {
+        let job = Arc::new(ActiveJob {
             job_id: template_id,
             header,
-            transactions: tpl.transactions.clone(),
+            transactions: tpl.transactions,
             epoch_seed,
             share_difficulty: self.share_difficulty,
             created_at: hyphen_core::timestamp::ntp_adjusted_timestamp_secs(),
@@ -99,7 +126,7 @@ impl JobManager {
                     .map_err(|_| "template parent work commitment must be exactly 32 bytes")?,
             ),
             clean_jobs: tpl.clean,
-        };
+        });
 
         {
             let mut jobs = self.jobs.write();
@@ -118,6 +145,7 @@ impl JobManager {
             if jobs.len() > 16 {
                 let oldest_key = jobs
                     .iter()
+                    .filter(|(key, _)| **key != job.job_id)
                     .min_by_key(|(_, j)| j.created_at)
                     .map(|(k, _)| *k);
                 if let Some(k) = oldest_key {
@@ -139,10 +167,18 @@ impl JobManager {
     }
 
     pub fn get_job(&self, job_id: &[u8; 32]) -> Option<ActiveJob> {
+        self.shared_job(job_id).map(Arc::unwrap_or_clone)
+    }
+
+    pub(crate) fn shared_job(&self, job_id: &[u8; 32]) -> Option<Arc<ActiveJob>> {
         self.jobs.read().get(job_id).cloned()
     }
 
     pub fn current_job(&self) -> Option<ActiveJob> {
+        self.shared_current_job().map(Arc::unwrap_or_clone)
+    }
+
+    pub(crate) fn shared_current_job(&self) -> Option<Arc<ActiveJob>> {
         self.current_job.read().clone()
     }
 
@@ -153,15 +189,28 @@ impl JobManager {
     /// release it, and a process that dies or stalls mid-submit must not wedge
     /// the pool, because a wedged job cannot produce a block and no new template
     /// arrives while the chain is stuck.
-    pub fn try_begin_block_submission(&self, job_id: [u8; 32]) -> bool {
-        let now = Instant::now();
-        let mut blocked = self.blocked_jobs.write();
-        blocked.retain(|_, claimed_at| now.duration_since(*claimed_at) < BLOCK_SUBMISSION_LEASE);
-        blocked.insert(job_id, now).is_none()
+    pub fn try_begin_block_submission(
+        self: &Arc<Self>,
+        job_id: [u8; 32],
+    ) -> Option<SubmissionLease> {
+        self.claim_at(job_id, Instant::now())
     }
 
-    pub fn finish_block_submission(&self, job_id: [u8; 32]) {
-        self.blocked_jobs.write().remove(&job_id);
+    fn claim_at(self: &Arc<Self>, job_id: [u8; 32], now: Instant) -> Option<SubmissionLease> {
+        let mut blocked = self.blocked_jobs.write();
+        if blocked
+            .get(&job_id)
+            .is_some_and(|owner| now.duration_since(**owner) < BLOCK_SUBMISSION_LEASE)
+        {
+            return None;
+        }
+        let started = Arc::new(now);
+        blocked.insert(job_id, Arc::clone(&started));
+        Some(SubmissionLease {
+            manager: Arc::clone(self),
+            job_id,
+            started,
+        })
     }
 
     pub fn is_blocked(&self, job_id: &[u8; 32]) -> bool {
@@ -169,7 +218,7 @@ impl JobManager {
         self.blocked_jobs
             .read()
             .get(job_id)
-            .is_some_and(|claimed_at| now.duration_since(*claimed_at) < BLOCK_SUBMISSION_LEASE)
+            .is_some_and(|claimed_at| now.duration_since(**claimed_at) < BLOCK_SUBMISSION_LEASE)
     }
 
     pub fn share_difficulty(&self) -> u64 {
@@ -190,45 +239,74 @@ mod tests {
     }
 
     #[test]
+    fn template_churn_bounds_history_and_shares_transaction_buffers() {
+        let manager = JobManager::new(1);
+        let header =
+            crate::primitives::build_genesis_block(&crate::primitives::ChainConfig::devnet())
+                .header;
+        let header_data = crate::wire_config(4096).serialize(&header).unwrap();
+        let mut observers = Vec::new();
+        for id in 0..128 {
+            let payload = vec![id; 256 * 1024];
+            let original = payload.as_ptr();
+            let template = BlockTemplate {
+                template_id: job_id(id).into(),
+                header_data: header_data.clone(),
+                epoch_seed: vec![0; 32],
+                parent_work_commitment: vec![0; 32],
+                transactions: vec![payload],
+                ..Default::default()
+            };
+            let job = manager.ingest_owned_template(template).unwrap();
+            assert_eq!(job.transactions[0].as_ptr(), original);
+            assert!(Arc::ptr_eq(&job, &manager.shared_current_job().unwrap()));
+            assert!(Arc::ptr_eq(&job, &manager.shared_job(&job.job_id).unwrap()));
+            observers.push(Arc::downgrade(&job));
+        }
+        assert_eq!(
+            observers
+                .iter()
+                .filter(|job| job.strong_count() > 0)
+                .count(),
+            16
+        );
+    }
+
+    #[test]
     fn only_one_candidate_may_submit_a_block_for_a_job() {
-        let manager = JobManager::new(10);
-        assert!(manager.try_begin_block_submission(job_id(1)));
+        let manager = Arc::new(JobManager::new(10));
+        let lease = manager.try_begin_block_submission(job_id(1)).unwrap();
         assert!(
-            !manager.try_begin_block_submission(job_id(1)),
+            manager.try_begin_block_submission(job_id(1)).is_none(),
             "a second miner must not race the node with the same height"
         );
         assert!(manager.is_blocked(&job_id(1)));
 
-        manager.finish_block_submission(job_id(1));
+        drop(lease);
         assert!(!manager.is_blocked(&job_id(1)));
         assert!(
-            manager.try_begin_block_submission(job_id(1)),
+            manager.try_begin_block_submission(job_id(1)).is_some(),
             "the claim must be reusable once released"
         );
     }
 
     #[test]
     fn a_claim_expires_so_a_stalled_submit_cannot_wedge_the_pool() {
-        let manager = JobManager::new(10);
-        assert!(manager.try_begin_block_submission(job_id(2)));
-
-        // Backdate the claim past its lease, as a stalled or killed submit would
-        // leave it.
-        {
-            let mut blocked = manager.blocked_jobs.write();
-            let stale = Instant::now()
-                .checked_sub(BLOCK_SUBMISSION_LEASE + Duration::from_secs(1))
-                .expect("clock has enough range");
-            blocked.insert(job_id(2), stale);
-        }
-
+        let manager = Arc::new(JobManager::new(10));
+        let start = Instant::now();
+        let id = job_id(2);
+        let expired = manager.claim_at(id, start).unwrap();
         assert!(
-            !manager.is_blocked(&job_id(2)),
-            "an expired claim must not reject work"
+            manager
+                .claim_at(id, start + BLOCK_SUBMISSION_LEASE / 2)
+                .is_none()
         );
-        assert!(
-            manager.try_begin_block_submission(job_id(2)),
-            "an expired claim must be replaceable"
-        );
+        let replacement = manager
+            .claim_at(id, start + BLOCK_SUBMISSION_LEASE)
+            .unwrap();
+        drop(expired);
+        assert!(manager.is_blocked(&id));
+        drop(replacement);
+        assert!(!manager.is_blocked(&id));
     }
 }
