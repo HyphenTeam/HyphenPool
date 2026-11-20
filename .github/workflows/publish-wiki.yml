@@ -1,0 +1,15 @@
+name: Publish wiki
+
+on:
+  push:
+    branches: [main]
+    paths: ['wiki/**', '.github/workflows/publish-wiki.yml']
+  schedule:
+    - cron: '27 * * * *'
+  workflow_dispatch:
+
+jobs:
+  publish:
+    permissions:
+      contents: write
+    uses: HyphenTeam/Hyphen/.github/workflows/publish-wiki.yml@main

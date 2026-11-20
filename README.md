@@ -1,6 +1,6 @@
 # Hyphen Pool
 
-[简体中文](README_CN.md)
+[简体中文](README_CN.md) · [Mining pool documentation](https://github.com/HyphenTeam/HyphenPool/wiki)
 
 Hyphen Pool connects miners to a Hyphen node, verifies submitted work and records rewards in a persistent ledger. SOLO pays the miner through the block reward. Shared modes use a separately operated Hyphen Wallet payout agent.
 

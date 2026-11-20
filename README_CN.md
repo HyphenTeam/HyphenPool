@@ -1,6 +1,6 @@
 # Hyphen Pool
 
-[English](README.md)
+[English](README.md) · [矿池运行指南](https://github.com/HyphenTeam/HyphenPool/wiki/Operations#中文说明)
 
 Hyphen Pool 将矿工连接到 Hyphen 节点，验证提交的工作量，并将奖励记入持久化账本。SOLO 模式直接通过区块奖励向矿工支付；共享模式通过单独运行的 Hyphen Wallet 付款代理完成支付。
 
