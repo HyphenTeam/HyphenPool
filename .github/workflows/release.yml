@@ -24,7 +24,7 @@ jobs:
         include:
           - { os: ubuntu-24.04, artifact: hyphen-pool-linux-x86_64, executable: hyphen-pool-server }
           - { os: windows-2022, artifact: hyphen-pool-windows-x86_64, executable: hyphen-pool-server.exe }
-          - { os: macos-14, artifact: hyphen-pool-macos-aarch64, executable: hyphen-pool-server }
+          - { os: macos-15, artifact: hyphen-pool-macos-aarch64, executable: hyphen-pool-server }
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:
