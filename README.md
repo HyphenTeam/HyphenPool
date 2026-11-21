@@ -2,7 +2,7 @@
 
 [简体中文](README_CN.md) · [Mining pool documentation](https://github.com/HyphenTeam/HyphenPool/wiki)
 
-Hyphen Pool connects miners to a Hyphen node, verifies submitted work and records rewards in a persistent ledger. SOLO pays the miner through the block reward. Shared modes use a separately operated Hyphen Wallet payout agent.
+Hyphen Pool serves neural mining jobs, verifies the nonce and persists the candidate before submitting it. The node pays the winning miner’s authorized address directly.
 
 ## Start a local pool
 
@@ -10,7 +10,7 @@ Start a devnet node with its Template Provider listening on `127.0.0.1:3350`. Ge
 
 ```sh
 cargo run --release --locked --bin hyphen-pool-server -- keygen --output pool.key
-cargo run --release --locked --bin hyphen-pool-server -- --network devnet --node 127.0.0.1:3350 --bind 127.0.0.1:3340 --api-bind 127.0.0.1:8081 --key-file pool.key --pool-state-dir pool_state --payout-mode solo
+cargo run --release --locked --bin hyphen-pool-server -- --network neural-devnet --node 127.0.0.1:3350 --bind 127.0.0.1:3340 --api-bind 127.0.0.1:8081 --key-file pool.key --pool-state-dir pool_state/neural-v3 --payout-mode solo
 ```
 
 [Accounting, payouts and recovery](wiki/Operations.md) · [Hyphen node](https://github.com/HyphenTeam/Hyphen)

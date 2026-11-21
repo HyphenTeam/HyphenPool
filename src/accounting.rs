@@ -498,8 +498,13 @@ impl PoolAccounting {
             view_keys.insert(config.pool_wallet, config.pool_view_public);
         }
         for ledger in state.miners.values() {
-            if ledger.wallet_address != [0u8; 32] && ledger.wallet_view_public != [0u8; 32] {
-                view_keys.insert(ledger.wallet_address, ledger.wallet_view_public);
+            if ledger.wallet_address != [0u8; 32]
+                && ledger.wallet_view_public != [0u8; 32]
+                && view_keys
+                    .insert(ledger.wallet_address, ledger.wallet_view_public)
+                    .is_some_and(|previous| previous != ledger.wallet_view_public)
+            {
+                return Err(AccountingError::MissingPayoutAddress);
             }
         }
         Ok(Self {
@@ -570,6 +575,9 @@ impl PoolAccounting {
         network_magic: [u8; 4],
     ) -> Result<([u8; 32], [u8; 32]), String> {
         if let Some(encoded) = input.strip_prefix("hy1") {
+            if encoded.len() > 95 {
+                return Err("invalid hy1 address length".into());
+            }
             let payload = base58::decode(encoded)
                 .map_err(|error| format!("invalid hy1 address base58: {error}"))?;
             if payload.len() != 69 {
@@ -591,6 +599,12 @@ impl PoolAccounting {
             view_public.copy_from_slice(&payload[1..33]);
             let mut spend_public = [0u8; 32];
             spend_public.copy_from_slice(&payload[33..65]);
+            hyphen_crypto::stealth::StealthAddress {
+                view_public,
+                spend_public,
+            }
+            .recipient_points()
+            .map_err(|error| error.to_string())?;
             return Ok((view_public, spend_public));
         }
 
@@ -620,9 +634,22 @@ impl PoolAccounting {
         self.state.read().pool_fee_bps
     }
 
-    /// Store the view_public for a given spend_public (miner address).
-    pub fn register_view_key(&self, spend_public: [u8; 32], view_public: [u8; 32]) {
-        self.view_keys.write().insert(spend_public, view_public);
+    /// Each spend-key ledger has one payout address, shared by its mining sessions.
+    pub fn register_view_key(
+        &self,
+        spend_public: [u8; 32],
+        view_public: [u8; 32],
+    ) -> Result<(), AccountingError> {
+        if *self
+            .view_keys
+            .write()
+            .entry(spend_public)
+            .or_insert(view_public)
+            != view_public
+        {
+            return Err(AccountingError::MissingPayoutAddress);
+        }
+        Ok(())
     }
 
     /// Look up the view_public for a given spend_public.
@@ -1419,7 +1446,7 @@ impl PoolAccounting {
                 }
                 return write.commit().map_err(storage_error);
             }
-            if self.network_magic == *b"HYNN" {
+            if self.network_magic == *b"HYN3" {
                 // The full solution is the only credit-bearing share on this profile.
                 self.apply_share(
                     &mut state,
@@ -1801,7 +1828,7 @@ fn encode_wallet_address(
 fn address_version(network: &[u8; 4]) -> Option<u8> {
     match network {
         b"HYPN" => Some(1),
-        b"HYTS" | b"HYDV" | b"HYNN" | b"HYCD" | b"HYAC" | b"HYOF" => Some(2),
+        b"HYTS" | b"HYDV" | b"HYN3" | b"HYCD" | b"HYAC" | b"HYOF" => Some(2),
         _ => None,
     }
 }
@@ -1940,16 +1967,17 @@ mod tests {
     #[test]
     fn accepts_test_address_on_devnet() {
         let mut payload = vec![0x02];
-        payload.extend_from_slice(&[7u8; 32]);
-        payload.extend_from_slice(&[8u8; 32]);
+        let (_, _, keys) = hyphen_crypto::stealth::generate_keys();
+        payload.extend_from_slice(&keys.view_public);
+        payload.extend_from_slice(&keys.spend_public);
         let checksum = blake3_hash(&payload);
         payload.extend_from_slice(&checksum.as_bytes()[..4]);
         let address = format!("hy1{}", base58::encode(&payload));
 
         let (view_public, spend_public) =
             PoolAccounting::parse_wallet_input(&address, [0x48, 0x59, 0x44, 0x56]).unwrap();
-        assert_eq!(view_public, [7u8; 32]);
-        assert_eq!(spend_public, [8u8; 32]);
+        assert_eq!(view_public, keys.view_public);
+        assert_eq!(spend_public, keys.spend_public);
     }
 
     #[test]
@@ -2067,7 +2095,7 @@ mod tests {
     fn duplicate_block_settlement_is_idempotent() {
         let mut config = sample_config();
         config.mode = PoolMode::Solo;
-        config.network_magic = *b"HYNN";
+        config.network_magic = *b"HYN3";
         config.pool_fee_bps = 0;
         let accounting = PoolAccounting::new(config);
         let miner = [41u8; 32];
@@ -2172,13 +2200,16 @@ mod tests {
         config.pool_view_public = [6u8; 32];
         config.state_dir = Some(test_dir.clone());
         let miner = [7u8; 32];
-        let view_public = [8u8; 32];
-        let wallet = [9u8; 32];
+        let (_, _, recipient) = hyphen_crypto::stealth::generate_keys();
+        let view_public = recipient.view_public;
+        let wallet = recipient.spend_public;
         let tx_hash = "ab".repeat(32);
 
         let intent_id = {
             let accounting = PoolAccounting::new(config.clone());
-            accounting.register_view_key(wallet, view_public);
+            accounting.register_view_key(wallet, view_public).unwrap();
+            assert!(accounting.register_view_key(wallet, [0xff; 32]).is_err());
+            assert_eq!(accounting.get_view_public(&wallet), Some(view_public));
             accounting.register_miner(miner, wallet);
             accounting.record_valid_share(miner, wallet, 1, 1, 100, 0);
 
@@ -2362,8 +2393,9 @@ mod tests {
         };
         let pool = PoolAccounting::try_new(config.clone()).unwrap();
         let candidate = |wallet, reward| {
-            let mut block =
-                crate::primitives::build_genesis_block(&crate::primitives::ChainConfig::devnet());
+            let mut block = crate::primitives::build_genesis_block(
+                &crate::primitives::ChainConfig::archived_devnet_v2(),
+            );
             block.header.height = 3;
             block.header.miner_pubkey = wallet;
             block.header.reward = reward;
@@ -2508,7 +2540,7 @@ mod tests {
             ..sample_config()
         });
         let miner = [1; 32];
-        pool.register_view_key(miner, [2; 32]);
+        pool.register_view_key(miner, [2; 32]).unwrap();
         pool.register_miner(miner, miner);
         pool.record_valid_share(miner, miner, 1, 1, 100, 0);
         pool.begin_reward_scan();
@@ -2550,7 +2582,7 @@ mod tests {
         let first = [1; 32];
         let second = [2; 32];
         let pool = PoolAccounting::new(config.clone());
-        pool.register_view_key(wallet, [8; 32]);
+        pool.register_view_key(wallet, [8; 32]).unwrap();
         for miner in [first, second] {
             pool.register_miner(miner, wallet);
             pool.record_valid_share(miner, wallet, 1, 2, 100, 0);

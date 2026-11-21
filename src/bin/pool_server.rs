@@ -41,8 +41,8 @@ struct Cli {
     /// Consensus network used by the template provider and miners.
     #[arg(
         long,
-        value_parser = ["mainnet", "testnet", "devnet", "neural-devnet", "contract-devnet", "compute-devnet", "offline-devnet"],
-        default_value = "devnet"
+        value_parser = ["neural-devnet", "testnet", "mainnet"],
+        default_value = "neural-devnet"
     )]
     network: String,
 
@@ -63,9 +63,9 @@ struct Cli {
     #[arg(long, default_value = "data")]
     data_dir: String,
 
-    /// Data directory for pool accounting persistence
-    #[arg(long, default_value = "pool_state")]
-    pool_state_dir: String,
+    /// Defaults to pool_state/neural-v3 on neural-devnet and pool_state otherwise.
+    #[arg(long)]
+    pool_state_dir: Option<PathBuf>,
 
     /// Disable pool accounting HTTP API
     #[arg(long)]
@@ -149,7 +149,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
 
     if let Some(Commands::BlockCredits {
         state_dir,
@@ -182,32 +182,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let cfg = match cli.network.as_str() {
-        "mainnet" => ChainConfig::mainnet(),
-        "testnet" => ChainConfig::testnet(),
-        "devnet" => ChainConfig::devnet(),
-        "neural-devnet" => ChainConfig::neural_devnet(),
-        "compute-devnet" => ChainConfig {
-            network_name: "hyphen-compute-devnet-v1".into(),
-            network_magic: *b"HYAC",
-            consensus_features: hyphen_core::FEATURE_USEFUL_WORK
-                | hyphen_pool::primitives::FEATURE_ASSET_RULES_V1
-                | (1 << 10),
-            ..ChainConfig::devnet()
-        },
-        "offline-devnet" => ChainConfig {
-            network_name: "hyphen-offline-devnet-v1".into(),
-            network_magic: *b"HYOF",
-            consensus_features: hyphen_pool::primitives::FEATURE_ASSET_RULES_V1 | (1 << 11),
-            ..ChainConfig::devnet()
-        },
-        "contract-devnet" => ChainConfig {
-            network_name: "hyphen-contract-devnet-v1".into(),
-            network_magic: *b"HYCD",
-            consensus_features: hyphen_core::FEATURE_WASM
-                | hyphen_pool::primitives::FEATURE_ASSET_RULES_V1,
-            ..ChainConfig::devnet()
-        },
+    let (cfg, default_state_dir) = match cli.network.as_str() {
+        "neural-devnet" => (ChainConfig::neural_devnet(), "pool_state/neural-v3"),
+        "testnet" => (ChainConfig::testnet(), "pool_state"),
+        "mainnet" => (ChainConfig::mainnet(), "pool_state"),
         _ => unreachable!("clap validates network"),
     };
 
@@ -232,13 +210,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if cli.pplns_window_factor == 0 {
         return Err("--pplns-window-factor must be greater than zero".into());
     }
-    if cli.network == "mainnet" {
-        if cli.standalone {
-            return Err("standalone pool mode is a test harness and is disabled on mainnet".into());
-        }
-        if cli.key_file.is_empty() || cli.pool_wallet.is_empty() {
-            return Err("mainnet pools require both --key-file and --pool-wallet".into());
-        }
+    if cli.network == "mainnet" && (cli.key_file.is_empty() || cli.pool_wallet.is_empty()) {
+        return Err("mainnet pools require both --key-file and --pool-wallet".into());
     }
     if cli.payout_mode != PoolMode::Solo
         && (cli.payout_agent.is_empty() || cli.payout_token_file.is_empty())
@@ -311,7 +284,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         pool_view_public,
         network_magic: cfg.network_magic,
         pplns_window_factor: cli.pplns_window_factor,
-        state_dir: Some(PathBuf::from(&cli.pool_state_dir)),
+        state_dir: Some(
+            cli.pool_state_dir
+                .take()
+                .unwrap_or_else(|| default_state_dir.into()),
+        ),
     })?);
     if accounting.mode() != cli.payout_mode {
         return Err(format!(

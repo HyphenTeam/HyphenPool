@@ -71,19 +71,9 @@ pub fn verify_neural_share(
         return ShareVerdict::Invalid(format!("unsupported block version {}", header.version));
     }
     let spec = hyphen_neural::PROFILE_SPEC;
-    if solution.len() != spec.input_dim as usize {
-        return ShareVerdict::Invalid(format!(
-            "solution carries {} values, the profile wants {}",
-            solution.len(),
-            spec.input_dim
-        ));
-    }
-    let values: Vec<i64> = solution.iter().map(|value| *value as i64).collect();
-    let limit = hyphen_neural::fixed::ONE;
-    if values.iter().any(|value| !(-limit..=limit).contains(value)) {
-        return ShareVerdict::Invalid("solution component outside [-ONE, ONE]".into());
-    }
-
+    let [nonce] = solution else {
+        return ShareVerdict::Invalid("neural block work requires one nonce".into());
+    };
     let seed = hyphen_core::neural_work_seed(parent_hash, header.height, miner_pubkey);
     let descriptor = hyphen_neural::WorkDescriptor {
         epoch: header.height,
@@ -94,13 +84,7 @@ pub fn verify_neural_share(
     if descriptor.validate().is_err() {
         return ShareVerdict::Invalid("job carries an unusable work threshold".into());
     }
-    let mut weights = vec![0_i64; spec.weight_count()];
-    if descriptor.derive_weights(&mut weights).is_err() {
-        return ShareVerdict::Invalid("cannot derive the work network".into());
-    }
-    let mut hidden = vec![0_i64; spec.hidden_dim as usize];
-    let mut output = vec![0_i64; spec.output_dim as usize];
-    match descriptor.verify(&weights, &values, &mut hidden, &mut output) {
+    match hyphen_neural::block_work::verify_nonce(&descriptor, *nonce) {
         Ok(true) => ShareVerdict::BlockFound {
             commitment: hyphen_core::neural_work_commitment(
                 parent_hash,
@@ -212,7 +196,7 @@ mod tests {
 
     #[test]
     fn full_list_is_a_block_and_short_list_is_credit() {
-        let config = ChainConfig::devnet();
+        let config = ChainConfig::archived_devnet_v2();
         let length = config.pouw_chain_length;
         let parent = Hash256::from_bytes([5u8; 32]);
         let block_header = header(2);
@@ -235,7 +219,7 @@ mod tests {
 
     #[test]
     fn malformed_witness_lists_are_rejected() {
-        let config = ChainConfig::devnet();
+        let config = ChainConfig::archived_devnet_v2();
         let length = config.pouw_chain_length;
         let parent = Hash256::from_bytes([6u8; 32]);
         let block_header = header(2);
@@ -286,26 +270,15 @@ mod tests {
         };
         let mut weights = vec![0_i64; spec.weight_count()];
         descriptor.derive_weights(&mut weights).unwrap();
-        let mut solution = vec![0_i64; spec.input_dim as usize];
-        let mut hidden = vec![0_i64; spec.hidden_dim as usize];
-        let mut output = vec![0_i64; spec.output_dim as usize];
-        let mut scratch = vec![0_i64; spec.input_dim as usize];
-        let outcome = hyphen_neural::search_work(
-            &descriptor,
-            &weights,
-            0,
-            1,
-            1 << 20,
-            &mut solution,
-            &mut hidden,
-            &mut output,
-            &mut scratch,
-        )
-        .unwrap();
-        assert!(outcome.found);
-
+        let nonce = (0..1_000_000)
+            .find(|&n| {
+                let score =
+                    hyphen_neural::block_work::nonce_score(&descriptor, &weights, n).unwrap();
+                hyphen_neural::block_work::qualifies(&descriptor, n, score).unwrap()
+            })
+            .unwrap();
+        let encoded = vec![nonce];
         let header = header_with_difficulty(1, threshold);
-        let encoded: Vec<u64> = solution.iter().map(|value| *value as u64).collect();
         assert!(matches!(
             verify_neural_share(&header, &parent, &miner, &encoded),
             ShareVerdict::BlockFound { .. }

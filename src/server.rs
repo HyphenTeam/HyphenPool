@@ -705,11 +705,12 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                 "pool protocol v3 requires a 64-byte view/spend payout address".into(),
             ));
         }
-        if view_public == [0u8; 32] || wallet_addr == [0u8; 32] {
-            return Err(PoolError::Internal(
-                "payout address contains a zero public key".into(),
-            ));
+        hyphen_crypto::stealth::StealthAddress {
+            view_public,
+            spend_public: wallet_addr,
         }
+        .recipient_points()
+        .map_err(|error| PoolError::Internal(format!("invalid payout address: {error}")))?;
 
         info!(
             "Miner authenticated: id={}, addr={}, pk={}, wallet={}, threads={}",
@@ -737,6 +738,9 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
                     "miner already has an active session".into(),
                 ));
             }
+            self.accounting
+                .register_view_key(wallet_addr, view_public)
+                .map_err(|error| PoolError::Internal(error.to_string()))?;
             miners.insert(
                 miner_pk,
                 MinerSession {
@@ -763,7 +767,6 @@ impl<T: TemplateProvider + Send + Sync + 'static> PoolServer<T> {
             server: self.as_ref(),
             miner_pk,
         };
-        self.accounting.register_view_key(wallet_addr, view_public);
         self.accounting.register_miner(miner_pk, wallet_addr);
 
         let mut job_rx = self.job_tx.subscribe();

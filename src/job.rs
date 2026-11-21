@@ -241,9 +241,10 @@ mod tests {
     #[test]
     fn template_churn_bounds_history_and_shares_transaction_buffers() {
         let manager = JobManager::new(1);
-        let header =
-            crate::primitives::build_genesis_block(&crate::primitives::ChainConfig::devnet())
-                .header;
+        let header = crate::primitives::build_genesis_block(
+            &crate::primitives::ChainConfig::archived_devnet_v2(),
+        )
+        .header;
         let header_data = crate::wire_config(4096).serialize(&header).unwrap();
         let mut observers = Vec::new();
         for id in 0..128 {

@@ -484,7 +484,7 @@ mod tests {
         ));
         let miner = [7; 32];
         let recipient = [8; 32];
-        accounting.register_view_key(recipient, [5; 32]);
+        accounting.register_view_key(recipient, [5; 32]).unwrap();
         accounting.register_miner(miner, recipient);
         accounting.record_valid_share(miner, recipient, 1, 1, 100, 0);
 

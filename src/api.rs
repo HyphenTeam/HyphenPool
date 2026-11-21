@@ -764,7 +764,8 @@ mod tests {
     #[test]
     fn wallet_balance_reports_the_ledger_of_a_registered_miner() {
         let accounting = accounting();
-        let wallet = [7u8; 32];
+        let (_, _, keys) = hyphen_crypto::stealth::generate_keys();
+        let wallet = keys.spend_public;
         accounting.register_miner([1u8; 32], wallet);
         accounting.record_valid_share([1u8; 32], wallet, 100, 1_000, 500, 0);
 
@@ -780,7 +781,7 @@ mod tests {
             .get(&format!(
                 "{}/api/pool/wallet/{}/balance?limit=4",
                 api.base_url(),
-                address([7u8; 32], wallet)
+                address(keys.view_public, wallet)
             ))
             .expect("the balance endpoint answers");
         assert_eq!(response.status.as_u16(), 200);
@@ -822,7 +823,8 @@ mod tests {
     #[test]
     fn an_out_of_range_limit_is_clamped_not_rejected() {
         let accounting = accounting();
-        let wallet = [7u8; 32];
+        let (_, _, keys) = hyphen_crypto::stealth::generate_keys();
+        let wallet = keys.spend_public;
         accounting.register_miner([1u8; 32], wallet);
 
         let api = start_pool_api(
@@ -837,7 +839,7 @@ mod tests {
             .get(&format!(
                 "{}/api/pool/wallet/{}/balance?limit=100000",
                 api.base_url(),
-                address([7u8; 32], wallet)
+                address(keys.view_public, wallet)
             ))
             .expect("the balance endpoint answers");
         assert_eq!(response.status.as_u16(), 200);

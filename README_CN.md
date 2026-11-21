@@ -2,7 +2,7 @@
 
 [English](README.md) · [矿池运行指南](https://github.com/HyphenTeam/HyphenPool/wiki/Operations#中文说明)
 
-Hyphen Pool 将矿工连接到 Hyphen 节点，验证提交的工作量，并将奖励记入持久化账本。SOLO 模式直接通过区块奖励向矿工支付；共享模式通过单独运行的 Hyphen Wallet 付款代理完成支付。
+Hyphen Pool 向矿工分发神经挖矿任务，复算 nonce 的两阶段工作量，持久化候选区块后提交给节点。奖励直接支付给矿工授权的地址。
 
 ## 启动本地矿池
 
@@ -10,7 +10,7 @@ Hyphen Pool 将矿工连接到 Hyphen 节点，验证提交的工作量，并将
 
 ```sh
 cargo run --release --locked --bin hyphen-pool-server -- keygen --output pool.key
-cargo run --release --locked --bin hyphen-pool-server -- --network devnet --node 127.0.0.1:3350 --bind 127.0.0.1:3340 --api-bind 127.0.0.1:8081 --key-file pool.key --pool-state-dir pool_state --payout-mode solo
+cargo run --release --locked --bin hyphen-pool-server -- --network neural-devnet --node 127.0.0.1:3350 --bind 127.0.0.1:3340 --api-bind 127.0.0.1:8081 --key-file pool.key --pool-state-dir pool_state/neural-v3 --payout-mode solo
 ```
 
 [记账、付款与重启恢复](wiki/Operations.md) · [Hyphen 节点](https://github.com/HyphenTeam/Hyphen)

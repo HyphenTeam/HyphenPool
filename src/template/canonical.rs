@@ -110,7 +110,7 @@ mod tests {
 
     #[tokio::test]
     async fn old_provider_and_mismatched_replies_keep_reservations_closed() {
-        let cfg = ChainConfig::devnet();
+        let cfg = ChainConfig::archived_devnet_v2();
         let directory =
             std::env::temp_dir().join(format!("hyphen-provider-reply-{}", crate::random_u64()));
         let accounting = PoolAccounting::new(PoolAccountingConfig {
@@ -123,7 +123,7 @@ mod tests {
             state_dir: Some(directory.clone()),
         });
         let miner = [1; 32];
-        accounting.register_view_key(miner, [2; 32]);
+        accounting.register_view_key(miner, [2; 32]).unwrap();
         accounting.register_miner(miner, miner);
         accounting.record_valid_share(miner, miner, 1, 1, 100, 0);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
